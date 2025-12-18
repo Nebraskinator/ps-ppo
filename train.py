@@ -8,7 +8,7 @@ from inference import InferenceActor
 from learner import LearnerActor, LearnerConfig
 from worker import RolloutWorker, RolloutConfig
 
-import sys, asyncio
+import sys
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -41,7 +41,6 @@ async def main():
     )
 
     # ---- Create inference actor on GPU ----
-    # IMPORTANT: Ray schedules GPU by num_gpus. This actor owns the GPU for inference.
     infer = ray.remote(num_gpus=0.35)(InferenceActor).remote(
         n_tokens=74,
         model_dim=64,

@@ -11,7 +11,7 @@ from poke_env import AccountConfiguration, ServerConfiguration
 
 from showdown_obs import build_unified_tokens, count_faints_from_tokens
 
-import sys, asyncio
+import sys
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -48,6 +48,89 @@ class RolloutConfig:
 
     # NEW: backpressure (prevents unbounded pending requests)
     infer_max_pending: int = 20000
+    
+    learn_min_episodes: int = 32
+    learn_max_episodes: int = 256
+    learn_wait_ms: float = 5.0
+    learn_max_pending_episodes: int = 2000
+
+class WorkerLearnerClient:
+    def __init__(self, learner_actor, *, min_episodes, max_episodes, wait_ms, max_pending_episodes):
+        self.learner_actor = learner_actor
+        self.min_episodes = int(min_episodes)
+        self.max_episodes = int(max_episodes)
+        self.wait_ms = float(wait_ms)
+
+        self._q: asyncio.Queue = asyncio.Queue()
+        self._pending = 0
+        self._max_pending = int(max_pending_episodes)
+
+        self.total_episodes = 0
+        self.total_flushes = 0
+        self.total_batches = 0
+        self.dropped = 0
+
+        self._loop = asyncio.get_event_loop()
+        self._task = self._loop.create_task(self._loop_coro())
+
+    def submit_episode(self, tokens, tmask, amask, act, logp, val, rew, done) -> None:
+        def _enqueue():
+            if self._pending >= self._max_pending:
+                self.dropped += 1
+                return
+            self._pending += 1
+            self.total_episodes += 1
+            self._q.put_nowait((tokens, tmask, amask, act, logp, val, rew, done))
+
+        try:
+            self._loop.call_soon_threadsafe(_enqueue)
+        except RuntimeError:
+            self.dropped += 1
+
+    async def _loop_coro(self):
+        while True:
+            items = []
+            try:
+                first = await asyncio.wait_for(self._q.get(), timeout=self.wait_ms / 1000.0)
+                items.append(first)
+            except asyncio.TimeoutError:
+                continue
+
+            for _ in range(self.max_episodes - 1):
+                try:
+                    items.append(self._q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            if len(items) < self.min_episodes:
+                await asyncio.sleep(self.wait_ms / 1000.0)
+                for _ in range(self.max_episodes - len(items)):
+                    try:
+                        items.append(self._q.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
+            # pack -> one Ray call
+            lengths = np.asarray([it[3].shape[0] for it in items], dtype=np.int32)
+
+            tokens_cat = np.concatenate([it[0] for it in items], axis=0).astype(np.float32, copy=False)
+            tmask_cat  = np.concatenate([it[1] for it in items], axis=0).astype(np.float32, copy=False)
+            amask_cat  = np.concatenate([it[2] for it in items], axis=0).astype(np.float32, copy=False)
+            act_cat    = np.concatenate([it[3] for it in items], axis=0).astype(np.int64,  copy=False)
+            logp_cat   = np.concatenate([it[4] for it in items], axis=0).astype(np.float32, copy=False)
+            val_cat    = np.concatenate([it[5] for it in items], axis=0).astype(np.float32, copy=False)
+            rew_cat    = np.concatenate([it[6] for it in items], axis=0).astype(np.float32, copy=False)
+            done_cat   = np.concatenate([it[7] for it in items], axis=0).astype(np.float32, copy=False)
+
+            try:
+                self.learner_actor.submit_packed_batch.remote(
+                    tokens_cat, tmask_cat, amask_cat, act_cat, logp_cat, val_cat, rew_cat, done_cat, lengths
+                )
+                self.total_flushes += 1
+                self.total_batches += len(items)
+            finally:
+                self._pending = max(0, self._pending - len(items))
+
 
 
 class WorkerInferenceClient:
@@ -68,9 +151,10 @@ class WorkerInferenceClient:
         self.min_batch = int(min_batch)
         self.max_batch = int(max_batch)
         self.wait_ms = float(wait_ms)
+        
+        self._pending_sem = asyncio.Semaphore(int(max_pending))
 
         self._q: asyncio.Queue = asyncio.Queue()
-        self._pending_sem = asyncio.Semaphore(int(max_pending))
 
         self._task = asyncio.get_event_loop().create_task(self._loop())
 
@@ -113,7 +197,6 @@ class WorkerInferenceClient:
                         break
 
             # Stack to [B,...]
-            B = len(items)
             tokens_b = np.stack([it[1] for it in items], axis=0).astype(np.float32, copy=False)  # [B,N,D]
             tmask_b  = np.stack([it[2] for it in items], axis=0).astype(np.float32, copy=False)  # [B,N]
             amask_b  = np.stack([it[3] for it in items], axis=0).astype(np.float32, copy=False)  # [B,A]
@@ -139,9 +222,10 @@ class RayBatchedPlayer(Player):
     """
     One poke-env Player, actions come via per-worker local batcher -> InferenceActor.
     """
-    def __init__(self, *, infer_client: WorkerInferenceClient, learner_actor, agent_id: int, cfg: RolloutConfig, **kwargs):
+    def __init__(self, *, infer_client: WorkerInferenceClient, learn_client: WorkerLearnerClient, learner_actor, agent_id: int, cfg: RolloutConfig, **kwargs):
         super().__init__(**kwargs)
         self.infer_client = infer_client
+        self.learn_client = learn_client
         self.learner_actor = learner_actor
         self.agent_id = int(agent_id)
         self.cfg = cfg
@@ -227,7 +311,7 @@ class RayBatchedPlayer(Player):
                 prev_self, prev_opp = cur_self, cur_opp
 
             # fire-and-forget (don’t wrap in create_task; just submit)
-            self.learner_actor.submit_episode.remote(tokens, tmask, amask, act, logp, val, rew, done)
+            self.learn_client.submit_episode(tokens, tmask, amask, act, logp, val, rew, done)
 
         finally:
             try:
@@ -297,13 +381,20 @@ class RolloutWorker:
         self.server_conf = make_server_conf("localhost", server_port)
         self.run_tag = secrets.token_hex(3)
 
-        # NEW: local inference client for this worker process
         self.infer_client = WorkerInferenceClient(
             inference_actor,
             min_batch=cfg.infer_min_batch,
             max_batch=cfg.infer_max_batch,
             wait_ms=cfg.infer_wait_ms,
             max_pending=cfg.infer_max_pending,
+        )
+        
+        self.learn_client = WorkerLearnerClient(
+            learner_actor,
+            min_episodes=cfg.learn_min_episodes,
+            max_episodes=cfg.learn_max_episodes,
+            wait_ms=cfg.learn_wait_ms,
+            max_pending_episodes=cfg.learn_max_pending_episodes,
         )
 
     async def run(self, *, rooms_per_pair: Optional[int] = None):
@@ -317,6 +408,7 @@ class RolloutWorker:
 
             pA = RayBatchedPlayer(
                 infer_client=self.infer_client,
+                learn_client=self.learn_client,
                 learner_actor=self.learner_actor,
                 agent_id=(2 * p + 0),
                 cfg=self.cfg,
@@ -332,6 +424,7 @@ class RolloutWorker:
             )
             pB = RayBatchedPlayer(
                 infer_client=self.infer_client,
+                learn_client=self.learn_client,
                 learner_actor=self.learner_actor,
                 agent_id=(2 * p + 1),
                 cfg=self.cfg,
