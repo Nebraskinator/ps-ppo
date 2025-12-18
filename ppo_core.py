@@ -80,25 +80,43 @@ class ActorCritic(nn.Module):
 class ActorCriticTransformer(nn.Module):
     def __init__(
         self,
-        n_tokens: int,
-        token_in_dim: int,
         act_dim: int,
-        model_dim: int = 32,
+        *,
+        model_dim: int = 128,
         n_layers: int = 4,
-        n_heads: int = 1,
+        n_heads: int = 4,
         ff_mult: int = 4,
         dropout: float = 0.0,
+        # ---- obs schema ----
+        t_max: int = 128,
+        float_dim: int = 16,
+        n_tok_types: int = 8,
+        n_owner: int = 3,
+        n_pos: int = 7,       # 0..5 plus POS_NA=6
+        n_subpos: int = 5,    # 0..3 plus SUBPOS_NA=4
+        n_entity: int = 1,    # set to showdown_obs.N_ENTITY
     ):
         super().__init__()
-        self.n_tokens = n_tokens
-        self.token_in_dim = token_in_dim
         self.act_dim = act_dim
+        self.t_max = t_max
+        self.float_dim = float_dim
 
-        self.token_proj = nn.Sequential(
-            nn.LayerNorm(token_in_dim),
-            nn.Linear(token_in_dim, model_dim),
-            nn.Tanh(),
+        # floats -> model_dim
+        self.float_proj = nn.Sequential(
+            nn.LayerNorm(float_dim),
+            nn.Linear(float_dim, model_dim),
+            nn.GELU(),
+            nn.Linear(model_dim, model_dim),
         )
+
+        # categorical embeddings (all summed)
+        self.type_emb   = nn.Embedding(n_tok_types, model_dim)
+        self.owner_emb  = nn.Embedding(n_owner, model_dim)
+        self.pos_emb    = nn.Embedding(n_pos, model_dim)
+        self.subpos_emb = nn.Embedding(n_subpos, model_dim)
+        self.entity_emb = nn.Embedding(n_entity, model_dim)
+
+        self.in_ln = nn.LayerNorm(model_dim)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=model_dim,
@@ -112,9 +130,9 @@ class ActorCriticTransformer(nn.Module):
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
 
         self.pi = nn.Linear(model_dim, act_dim)
-        self.v = nn.Linear(model_dim, 1)
+        self.v  = nn.Linear(model_dim, 1)
 
-        # modest init
+        # init (same style you used)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
@@ -122,25 +140,45 @@ class ActorCriticTransformer(nn.Module):
         nn.init.orthogonal_(self.pi.weight, gain=0.01)
         nn.init.orthogonal_(self.v.weight, gain=1.0)
 
-    def forward(self, tokens: torch.Tensor, token_mask: Optional[torch.Tensor] = None):
-        """
-        tokens: [B, N, D_in]
-        token_mask: [B, N] where 1=keep, 0=pad (optional; here mostly all ones)
-        """
-        x = self.token_proj(tokens)  # [B, N, model_dim]
+        # make embedding(0) be ~neutral for "NONE"/padding IDs
+        nn.init.zeros_(self.entity_emb.weight.data[0])
+        nn.init.zeros_(self.type_emb.weight.data[0])  # TT_CLS is 0 in your vocab, fine either way
+        nn.init.zeros_(self.owner_emb.weight.data[2]) # OWNER_NONE=2 (optional)
+        nn.init.zeros_(self.pos_emb.weight.data[-1])  # POS_NA
+        nn.init.zeros_(self.subpos_emb.weight.data[-1])  # SUBPOS_NA
+
+    def forward(
+        self,
+        float_feats: torch.Tensor,   # [B, T, F]
+        tok_type: torch.Tensor,      # [B, T]
+        owner: torch.Tensor,         # [B, T]
+        pos: torch.Tensor,           # [B, T]
+        subpos: torch.Tensor,        # [B, T]
+        entity_id: torch.Tensor,     # [B, T]
+        token_mask: Optional[torch.Tensor] = None,  # [B, T] 1=keep,0=pad
+    ):
+        # floats
+        x = self.float_proj(float_feats)
+
+        # categorical sums
+        x = x \
+            + self.type_emb(tok_type) \
+            + self.owner_emb(owner) \
+            + self.pos_emb(pos) \
+            + self.subpos_emb(subpos) \
+            + self.entity_emb(entity_id)
+
+        x = self.in_ln(x)
 
         key_padding_mask = None
         if token_mask is not None:
-            # Transformer expects True for PAD positions
-            key_padding_mask = (token_mask <= 0.5)
+            key_padding_mask = (token_mask <= 0.5)  # True = PAD
 
-        h = self.encoder(x, src_key_padding_mask=key_padding_mask)  # [B, N, model_dim]
+        h = self.encoder(x, src_key_padding_mask=key_padding_mask)
 
-        # CLS token is index 0 by construction
-        cls = h[:, 0, :]  # [B, model_dim]
-
-        logits = self.pi(cls)           # [B, act_dim]
-        value = self.v(cls).squeeze(-1) # [B]
+        cls = h[:, 0, :]  # CLS index 0 by construction
+        logits = self.pi(cls)
+        value  = self.v(cls).squeeze(-1)
         return logits, value
 
 
@@ -326,10 +364,18 @@ class AsyncEpisodeDataset:
         self.act_dim = int(act_dim)
         self.device = device
         self.clear()
-
+    
+    def __len__(self):
+        return int(self.n_steps)
+    
     def clear(self):
         self._tensor_cache = None
-        self.tokens = []
+        self.float_feats = []
+        self.tok_type = []
+        self.owner = []
+        self.pos = []
+        self.subpos = []
+        self.entity_id = []
         self.tmask  = []
         self.amask  = []
         self.act    = []
@@ -339,29 +385,27 @@ class AsyncEpisodeDataset:
         self.ret    = []
         self.n_steps = 0
 
-    def __len__(self) -> int:
-        return int(self.n_steps)
+    def add_steps(self, float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask, act, logp, val, adv, ret):
+        # float_feats: [T, N, F]
+        # tok_type/owner/pos/subpos/entity_id: [T, N]
+        # tmask: [T, N], amask: [T, A]
+        # act/logp/val/adv/ret: [T]
+        def dev(x):
+            return x.detach().cpu() if self.device == "cpu" else x.detach().to(self.device)
 
-    def add_steps(self, tokens, tmask, amask, act, logp, val, adv, ret):
-        # tokens: [T, N, D], tmask: [T, N], amask: [T, A], act/logp/val/adv/ret: [T]
-        if self.device == "cpu":
-            self.tokens.append(tokens.detach().cpu())
-            self.tmask.append(tmask.detach().cpu())
-            self.amask.append(amask.detach().cpu())
-            self.act.append(act.detach().cpu())
-            self.logp.append(logp.detach().cpu())
-            self.val.append(val.detach().cpu())
-            self.adv.append(adv.detach().cpu())
-            self.ret.append(ret.detach().cpu())
-        else:
-            self.tokens.append(tokens.detach().to(self.device))
-            self.tmask.append(tmask.detach().to(self.device))
-            self.amask.append(amask.detach().to(self.device))
-            self.act.append(act.detach().to(self.device))
-            self.logp.append(logp.detach().to(self.device))
-            self.val.append(val.detach().to(self.device))
-            self.adv.append(adv.detach().to(self.device))
-            self.ret.append(ret.detach().to(self.device))
+        self.float_feats.append(dev(float_feats))
+        self.tok_type.append(dev(tok_type))
+        self.owner.append(dev(owner))
+        self.pos.append(dev(pos))
+        self.subpos.append(dev(subpos))
+        self.entity_id.append(dev(entity_id))
+        self.tmask.append(dev(tmask))
+        self.amask.append(dev(amask))
+        self.act.append(dev(act))
+        self.logp.append(dev(logp))
+        self.val.append(dev(val))
+        self.adv.append(dev(adv))
+        self.ret.append(dev(ret))
 
         self.n_steps += int(act.shape[0])
         self._tensor_cache = None
@@ -370,8 +414,14 @@ class AsyncEpisodeDataset:
         if self._tensor_cache is not None:
             return self._tensor_cache
 
-        tokens = torch.cat(self.tokens, dim=0).to(self.device)
-        tmask  = torch.cat(self.tmask,  dim=0).to(self.device)
+        float_feats = torch.cat(self.float_feats, dim=0).to(self.device)
+        tok_type    = torch.cat(self.tok_type,    dim=0).to(self.device)
+        owner       = torch.cat(self.owner,       dim=0).to(self.device)
+        pos         = torch.cat(self.pos,         dim=0).to(self.device)
+        subpos      = torch.cat(self.subpos,      dim=0).to(self.device)
+        entity_id   = torch.cat(self.entity_id,   dim=0).to(self.device)
+        tmask       = torch.cat(self.tmask,       dim=0).to(self.device)
+
         amask  = torch.cat(self.amask,  dim=0).to(self.device)
         act    = torch.cat(self.act,    dim=0).to(self.device)
         logp   = torch.cat(self.logp,   dim=0).to(self.device)
@@ -379,18 +429,33 @@ class AsyncEpisodeDataset:
         adv    = torch.cat(self.adv,    dim=0).to(self.device)
         ret    = torch.cat(self.ret,    dim=0).to(self.device)
 
-        self._tensor_cache = (tokens, tmask, amask, act, logp, val, adv, ret)
+        self._tensor_cache = (float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask, act, logp, val, adv, ret)
         return self._tensor_cache
 
     def iter_minibatches(self, mb_size: int, shuffle: bool = True):
-        tokens, tmask, amask, act, logp, val, adv, ret = self.tensorize()
+        float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask, act, logp, val, adv, ret = self.tensorize()
         n = act.shape[0]
         idx = torch.arange(n, device=act.device)
         if shuffle:
             idx = idx[torch.randperm(n, device=act.device)]
         for start in range(0, n, mb_size):
             mb = idx[start:start + mb_size]
-            yield tokens[mb], tmask[mb], amask[mb], act[mb], logp[mb], val[mb], adv[mb], ret[mb]
+            yield (
+                float_feats[mb],
+                tok_type[mb],
+                owner[mb],
+                pos[mb],
+                subpos[mb],
+                entity_id[mb],
+                tmask[mb],
+                amask[mb],
+                act[mb],
+                logp[mb],
+                val[mb],
+                adv[mb],
+                ret[mb],
+            )
+
 
 
 @torch.no_grad()
@@ -438,8 +503,10 @@ def ppo_update(
     n_mb = 0
 
     for epoch in range(update_epochs):
-        for mb_tok, mb_tmask, mb_amask, mb_act, mb_logp_old, mb_val_old, mb_adv, mb_ret in dataset.iter_minibatches(minibatch_size):
-            logits, v = net(mb_tok, mb_tmask)
+        for (mb_ff, mb_tt, mb_own, mb_pos, mb_sub, mb_eid, mb_tmask,
+             mb_amask, mb_act, mb_logp_old, mb_val_old, mb_adv, mb_ret) in dataset.iter_minibatches(minibatch_size):
+        
+            logits, v = net(mb_ff, mb_tt, mb_own, mb_pos, mb_sub, mb_eid, mb_tmask)
             A = logits.shape[-1]
             if mb_act.min().item() < 0 or mb_act.max().item() >= A:
                 print(

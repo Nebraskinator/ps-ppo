@@ -1,34 +1,39 @@
 # train.py
 from __future__ import annotations
+
 import asyncio
 import math
+import sys
 import ray
 
+from config import RunConfig
 from inference import InferenceActor
-from learner import LearnerActor, LearnerConfig
-from worker import RolloutWorker, RolloutConfig
+from learner import LearnerActor
+from worker import RolloutWorker
 
-import sys
+
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 SERVER_PORTS = [8000, 8001, 8002, 8003, 8004, 8005, 8006, 8007]
 
+
 async def main():
     ray.init(ignore_reinit_error=True)
 
-    # ---- knobs ----
-    target_concurrent_battles = 4096
-    rooms_per_pair = 16
+    # ---- global config (single source of truth) ----
+    cfg = RunConfig.default()
+    
+    rooms_per_pair = int(cfg.rollout.rooms_per_pair)
+    target_concurrent_battles = int(cfg.rollout.target_concurrent_battles)
 
     # how many pairs total?
     total_pairs = math.ceil(target_concurrent_battles / rooms_per_pair)
 
     # how many pairs per worker actor (reduce websocket overhead)
     n_workers = len(SERVER_PORTS)
-    
     base = total_pairs // n_workers
-    rem  = total_pairs % n_workers
+    rem = total_pairs % n_workers
     pairs_per_worker_list = [base + (1 if i < rem else 0) for i in range(n_workers)]
 
     effective_concurrency = total_pairs * rooms_per_pair
@@ -39,50 +44,25 @@ async def main():
         f"effective_concurrency~={effective_concurrency} "
         f"pairs_per_worker={pairs_per_worker_list}"
     )
+    
+    # ---- Create inference + learner actors  ----
+    InferRemote = ray.remote(num_gpus=0.35)(InferenceActor)
+    LearnerRemote = ray.remote(num_gpus=0.65)(LearnerActor)
 
-    # ---- Create inference actor on GPU ----
-    infer = ray.remote(num_gpus=0.35)(InferenceActor).remote(
-        n_tokens=74,
-        model_dim=64,
-        n_layers=4,
-        n_heads=1,
-        act_dim=10,
-        device="cuda",
-    )
-
-    # ---- Create learner actor on GPU ----
-    learner_cfg = LearnerConfig(
-        n_tokens=74, 
-        model_dim=64, 
-        n_layers=4, 
-        n_heads=1, 
-        act_dim=10,
-        gamma=0.99, 
-        gae_lambda=0.95,
-        lr=3e-4, 
-        update_epochs=4, 
-        minibatch_size=4096,
-        clip_coef=0.2, 
-        ent_coef=0.01, 
-        vf_coef=0.5,
-        steps_per_update=32768,
-        device="cuda",
-    )
-    learner = ray.remote(num_gpus=0.65)(LearnerActor).remote(learner_cfg, infer)
+    infer = InferRemote.remote(cfg)
+    learner = LearnerRemote.remote(cfg, infer)
 
     # ---- Rollout workers (CPU only) ----
-    wcfg = RolloutConfig(battle_format="gen9randombattle", rooms_per_pair=rooms_per_pair)
-
     WorkerRemote = ray.remote(num_cpus=1)(RolloutWorker)
 
     workers = []
     for i, port in enumerate(SERVER_PORTS):
         pairs_here = pairs_per_worker_list[i]
         if pairs_here <= 0:
-            continue  # if fewer pairs than servers, some servers idle
+            continue
 
         w = WorkerRemote.remote(
-            wcfg,
+            cfg,
             infer,
             learner,
             pairs_in_worker=pairs_here,
@@ -93,16 +73,15 @@ async def main():
     print(f"[driver] started rollout_workers={len(workers)} (<= num_servers={len(SERVER_PORTS)})")
 
     # start workers
-    _run_refs  = [w.run.remote(rooms_per_pair=rooms_per_pair) for w in workers]
+    _run_refs = [w.run.remote(rooms_per_pair=rooms_per_pair) for w in workers]
 
-    # small monitor loop
+    # monitor loop (Ray ObjectRefs are not awaitables)
     while True:
-        istats, lstats = await asyncio.gather(
-            infer.get_stats.remote(),
-            learner.get_stats.remote(),
-        )
+        istats_ref = infer.get_stats.remote()
+        lstats_ref = learner.get_stats.remote()
+        istats, lstats = await asyncio.to_thread(ray.get, [istats_ref, lstats_ref])
         print(f"[stats] infer={istats} learner={lstats}")
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(4.0)
 
 
 if __name__ == "__main__":
