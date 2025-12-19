@@ -48,12 +48,14 @@ async def main():
     # ---- Create inference + learner actors  ----
     InferRemote = ray.remote(num_gpus=0.35)(InferenceActor)
     LearnerRemote = ray.remote(num_gpus=0.65)(LearnerActor)
-
-    infer = InferRemote.remote(cfg)
-    learner = LearnerRemote.remote(cfg, infer)
+    cfg_ref = ray.put(cfg)
+    _PINNED_REFS = [cfg_ref]
+    
+    infer = InferRemote.remote(cfg_ref)
+    learner = LearnerRemote.remote(cfg_ref, infer)
 
     # ---- Rollout workers (CPU only) ----
-    WorkerRemote = ray.remote(num_cpus=1)(RolloutWorker)
+    WorkerRemote = ray.remote(num_cpus=1)(RolloutWorker).options(max_restarts=-1, max_task_retries=0)
 
     workers = []
     for i, port in enumerate(SERVER_PORTS):
@@ -62,7 +64,7 @@ async def main():
             continue
 
         w = WorkerRemote.remote(
-            cfg,
+            cfg_ref,
             infer,
             learner,
             pairs_in_worker=pairs_here,
@@ -74,7 +76,7 @@ async def main():
 
     # start workers
     _run_refs = [w.run.remote(rooms_per_pair=rooms_per_pair) for w in workers]
-
+    
     # monitor loop (Ray ObjectRefs are not awaitables)
     while True:
         istats_ref = infer.get_stats.remote()

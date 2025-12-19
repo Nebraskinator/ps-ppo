@@ -12,7 +12,47 @@ from poke_env import AccountConfiguration, ServerConfiguration
 from showdown_obs import build_tokens
 from config import RunConfig
 
+import traceback
 import sys
+import os
+
+def install_asyncio_exception_logging(loop: asyncio.AbstractEventLoop, *, crash: bool) -> None:
+    def handler(loop, context):
+        # context keys often include: "message", "exception", "future"/"task"
+        msg = context.get("message", "asyncio exception")
+        exc = context.get("exception")
+
+        print("\n" + "="*80)
+        print(f"[ASYNCIO] {msg}")
+        if exc is not None:
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+        else:
+            # sometimes it's just a message + a task
+            print(context)
+        print("="*80 + "\n", flush=True)
+
+        if crash:
+            # Crash the actor process so Ray restarts it
+            # Using SystemExit reliably terminates the process.
+            raise os._exit(1)
+
+    loop.set_exception_handler(handler)
+
+def crash_on_task_error(task: asyncio.Task, name: str) -> None:
+    def _done(t: asyncio.Task):
+        try:
+            exc = t.exception()  # <-- this is the important part
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            print("\n" + "=" * 80)
+            print(f"[TASK FAILED] {name}")
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+            print("=" * 80 + "\n", flush=True)
+            raise os._exit(1)  # crash actor so Ray restarts it
+    task.add_done_callback(_done)
+
+
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -59,6 +99,7 @@ class WorkerLearnerClient:
 
         self._loop = asyncio.get_event_loop()
         self._task = self._loop.create_task(self._loop_coro())
+        crash_on_task_error(self._task, "WorkerLearnerClient._loop_coro")
 
     def submit_episode(self, float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask, act, logp, val, rew, done) -> None:
         def _enqueue():
@@ -149,6 +190,7 @@ class WorkerInferenceClient:
         self._q: asyncio.Queue = asyncio.Queue()
 
         self._task = asyncio.get_event_loop().create_task(self._loop())
+        crash_on_task_error(self._task, "WorkerInferenceClient._loop")
 
     async def request(
         self,
@@ -213,8 +255,16 @@ class WorkerInferenceClient:
             tmsk_b = np.stack([it[7] for it in items], axis=0).astype(np.float32, copy=False)  # [B,N]
             amask_b= np.stack([it[8] for it in items], axis=0).astype(np.float32, copy=False)  # [B,A]
             
-            ref = self.inference_actor.infer_batch.remote(ff_b, tt_b, own_b, pos_b, sub_b, eid_b, tmsk_b, amask_b)
-            act_b, logp_b, val_b = await asyncio.to_thread(ray.get, ref)
+            try:
+                ref = self.inference_actor.infer_batch.remote(
+                    ff_b, tt_b, own_b, pos_b, sub_b, eid_b, tmsk_b, amask_b
+                )
+                act_b, logp_b, val_b = await ref
+            except Exception as e:
+                for fut, *_ in items:
+                    if not fut.done():
+                        fut.set_exception(e)
+                raise
 
             # respond
             for i, (fut, *_rest) in enumerate(items):
@@ -282,7 +332,8 @@ class RayBatchedPlayer(Player):
                 tb.attn_mask, amask,
                 timeout_s=self.cfg.rollout.infer_timeout_s,
             )
-        except Exception:
+        except Exception as e:
+            print(f"[choose_move] infer failed: {e!r}", flush=True)
             return self.choose_random_move(battle)
         
         if key not in self._traj:
@@ -411,6 +462,9 @@ class RolloutWorker:
         pairs_in_worker: int,
         server_port: int,
     ):
+        loop = asyncio.get_event_loop()
+        install_asyncio_exception_logging(loop, crash=True)
+        
         self.inference_actor = inference_actor
         self.learner_actor = learner_actor
         self.pairs_in_worker = int(pairs_in_worker)
@@ -435,6 +489,7 @@ class RolloutWorker:
             wait_ms=cfg.rollout.learn_wait_ms,
             max_pending_episodes=cfg.rollout.learn_max_pending_episodes
         )
+
 
     async def run(self, *, rooms_per_pair: Optional[int] = None):
         rooms_per_pair = int(rooms_per_pair or self.cfg.rollout.rooms_per_pair)
