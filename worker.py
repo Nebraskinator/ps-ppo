@@ -16,29 +16,6 @@ import traceback
 import sys
 import os
 
-import time
-from dataclasses import dataclass, field
-
-@dataclass
-class InferStats:
-    enqueued: int = 0
-    completed: int = 0
-    timeouts: int = 0
-    errors: int = 0
-
-    flushes: int = 0
-    max_qsize: int = 0
-    max_inflight: int = 0
-
-    last_batch: int = 0
-    max_batch: int = 0
-
-    queue_wait_ms_sum: float = 0.0
-    rpc_ms_sum: float = 0.0
-
-    queue_wait_n: int = 0
-    rpc_n: int = 0
-
 
 def install_asyncio_exception_logging(loop: asyncio.AbstractEventLoop, *, crash: bool) -> None:
     def handler(loop, context):
@@ -58,7 +35,7 @@ def install_asyncio_exception_logging(loop: asyncio.AbstractEventLoop, *, crash:
         if crash:
             # Crash the actor process so Ray restarts it
             # Using SystemExit reliably terminates the process.
-            raise os._exit(1)
+            os._exit(1)
 
     loop.set_exception_handler(handler)
 
@@ -73,7 +50,7 @@ def crash_on_task_error(task: asyncio.Task, name: str) -> None:
             print(f"[TASK FAILED] {name}")
             traceback.print_exception(type(exc), exc, exc.__traceback__)
             print("=" * 80 + "\n", flush=True)
-            raise os._exit(1)  # crash actor so Ray restarts it
+            os._exit(1)  # crash actor so Ray restarts it
     task.add_done_callback(_done)
 
 
@@ -104,7 +81,6 @@ def battle_id_for(agent_id: int, battle) -> str:
         tag = f"pyid_{id(battle)}"
     return f"{agent_id}:{tag}"
 
-
 class WorkerLearnerClient:
     def __init__(self, learner_actor, *, min_episodes, max_episodes, wait_ms, max_pending_episodes):
         self.learner_actor = learner_actor
@@ -112,31 +88,46 @@ class WorkerLearnerClient:
         self.max_episodes = int(max_episodes)
         self.wait_ms = float(wait_ms)
 
-        self._q: asyncio.Queue = asyncio.Queue()
-        self._pending = 0
+        # episode-level backpressure
         self._max_pending = int(max_pending_episodes)
+        self._ep_sem = asyncio.Semaphore(self._max_pending)
+
+        self._q: asyncio.Queue = asyncio.Queue()  # can be unbounded; sem is the bound
+        self._pending = 0
 
         self.total_episodes = 0
         self.total_flushes = 0
         self.total_batches = 0
-        self.dropped = 0
 
         self._loop = asyncio.get_event_loop()
         self._task = self._loop.create_task(self._loop_coro())
         crash_on_task_error(self._task, "WorkerLearnerClient._loop_coro")
 
-    def submit_episode(self, float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask, act, logp, val, rew, done) -> None:
+    async def acquire_episode_slot(self) -> None:
+        # blocks when too many episodes are waiting to be flushed
+        await self._ep_sem.acquire()
+
+    def submit_episode(self, float_feats, tok_type, owner, pos, subpos, entity_id, tmask,
+                       amask, act, logp, val, rew, done) -> None:
+        """
+        Assumes caller has already acquired an episode slot via acquire_episode_slot().
+        This must NEVER drop; if the loop is dead, it's better to crash the actor.
+        """
         def _enqueue():
-            if self._pending >= self._max_pending:
-                self.dropped += 1
-                return
             self._pending += 1
             self.total_episodes += 1
-            self._q.put_nowait((float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask, act, logp, val, rew, done))
+            self._q.put_nowait((float_feats, tok_type, owner, pos, subpos, entity_id, tmask,
+                                amask, act, logp, val, rew, done))
+
         try:
             self._loop.call_soon_threadsafe(_enqueue)
-        except RuntimeError:
-            self.dropped += 1
+        except RuntimeError as e:
+            # event loop is gone: release permit so we don't leak, then crash
+            try:
+                self._loop.call_soon_threadsafe(self._ep_sem.release)
+            except Exception:
+                pass
+            raise
 
     async def _loop_coro(self):
         while True:
@@ -163,38 +154,38 @@ class WorkerLearnerClient:
 
             lengths = np.asarray([it[0].shape[0] for it in items], dtype=np.int32)
 
-            ff_cat   = np.concatenate([it[0] for it in items], axis=0).astype(np.float32, copy=False)  # [sumT,N,F]
-            tt_cat   = np.concatenate([it[1] for it in items], axis=0).astype(np.int64,  copy=False)  # [sumT,N]
+            ff_cat   = np.concatenate([it[0] for it in items], axis=0).astype(np.float32, copy=False)
+            tt_cat   = np.concatenate([it[1] for it in items], axis=0).astype(np.int64,  copy=False)
             own_cat  = np.concatenate([it[2] for it in items], axis=0).astype(np.int64,  copy=False)
             pos_cat  = np.concatenate([it[3] for it in items], axis=0).astype(np.int64,  copy=False)
             sub_cat  = np.concatenate([it[4] for it in items], axis=0).astype(np.int64,  copy=False)
             eid_cat  = np.concatenate([it[5] for it in items], axis=0).astype(np.int64,  copy=False)
-            tmsk_cat = np.concatenate([it[6] for it in items], axis=0).astype(np.float32, copy=False) # [sumT,N]
-            
-            amask_cat= np.concatenate([it[7] for it in items], axis=0).astype(np.float32, copy=False) # [sumT,A]
+            tmsk_cat = np.concatenate([it[6] for it in items], axis=0).astype(np.float32, copy=False)
+
+            amask_cat= np.concatenate([it[7] for it in items], axis=0).astype(np.float32, copy=False)
             act_cat  = np.concatenate([it[8] for it in items], axis=0).astype(np.int64,  copy=False)
             logp_cat = np.concatenate([it[9] for it in items], axis=0).astype(np.float32, copy=False)
             val_cat  = np.concatenate([it[10] for it in items], axis=0).astype(np.float32, copy=False)
             rew_cat  = np.concatenate([it[11] for it in items], axis=0).astype(np.float32, copy=False)
             done_cat = np.concatenate([it[12] for it in items], axis=0).astype(np.float32, copy=False)
-            
+
             try:
-                self.learner_actor.submit_packed_batch.remote(
+                ref = self.learner_actor.submit_packed_batch.remote(
                     ff_cat, tt_cat, own_cat, pos_cat, sub_cat, eid_cat, tmsk_cat,
                     amask_cat, act_cat, logp_cat, val_cat, rew_cat, done_cat, lengths
                 )
+                await asyncio.to_thread(ray.get, ref) 
                 self.total_flushes += 1
                 self.total_batches += len(items)
             finally:
-                self._pending = max(0, self._pending - len(items))
-
+                # bookkeeping + release episode slots (critical!)
+                n_eps = int(lengths.shape[0])
+                self._pending = max(0, self._pending - n_eps)
+                for _ in range(n_eps):
+                    self._ep_sem.release()
 
 
 class WorkerInferenceClient:
-    """
-    Lives inside ONE RolloutWorker process.
-    Batches many per-step requests into ONE Ray RPC: infer.infer_batch.remote(...)
-    """
     def __init__(
         self,
         inference_actor,
@@ -208,19 +199,12 @@ class WorkerInferenceClient:
         self.min_batch = int(min_batch)
         self.max_batch = int(max_batch)
         self.wait_ms = float(wait_ms)
-        
-        self._pending_sem = asyncio.Semaphore(int(max_pending))
-        self._max_pending = int(max_pending)
 
-        self._q: asyncio.Queue = asyncio.Queue()
-        
-        self.stats = InferStats()
+        # BOUNDED queue: provides real backpressure
+        self._q: asyncio.Queue = asyncio.Queue(maxsize=int(max_pending))
 
         self._task = asyncio.get_event_loop().create_task(self._loop())
         crash_on_task_error(self._task, "WorkerInferenceClient._loop")
-        
-        self._stats_task = asyncio.get_event_loop().create_task(self._log_stats_loop(every_s=10.0))
-        crash_on_task_error(self._stats_task, "WorkerInferenceClient._log_stats_loop")
 
     async def request(
         self,
@@ -233,77 +217,37 @@ class WorkerInferenceClient:
         tmask: np.ndarray,
         amask: np.ndarray,
         *,
-        timeout_s: float
+        timeout_s: Optional[float] = None,  # keep optional if you still want it
     ) -> Tuple[int, float, float]:
-        await self._pending_sem.acquire()
+        """
+        If overloaded, this will BLOCK at `await self._q.put(...)`.
+        If timeout_s is None, it will wait forever for inference.
+        """
         loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        t_enqueue = time.perf_counter()
-    
-        self.stats.enqueued += 1
-        inflight = self._max_pending - self._pending_sem._value
-        if inflight > self.stats.max_inflight:
-            self.stats.max_inflight = inflight
-        
-        self._q.put_nowait((fut, t_enqueue, float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask))
-    
-        try:
-            return await asyncio.wait_for(fut, timeout=timeout_s)
-        except asyncio.TimeoutError:
-            self.stats.timeouts += 1
-            raise
-        except Exception:
-            self.stats.errors += 1
-            raise
-        finally:
-            self._pending_sem.release()
+        fut: asyncio.Future = loop.create_future()
 
-    async def _log_stats_loop(self, every_s: float = 10.0):
-        while True:
-            await asyncio.sleep(every_s)
-            s = self.stats
-            avg_qwait = (s.queue_wait_ms_sum / s.queue_wait_n) if s.queue_wait_n else 0.0
-            avg_rpc = (s.rpc_ms_sum / s.rpc_n) if s.rpc_n else 0.0
-    
-            print(
-                f"[infer] flushes={s.flushes} qmax={s.max_qsize} inflight_max={s.max_inflight} "
-                f"batch_last={s.last_batch} batch_max={s.max_batch} "
-                f"qwait_ms_avg={avg_qwait:.2f} rpc_ms_avg={avg_rpc:.2f} "
-                f"timeouts={s.timeouts} errors={s.errors}",
-                flush=False
-            )
-            
+        # This is the key: block producers when queue is full
+        await self._q.put((fut, float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask))
+
+        if timeout_s is None:
+            return await fut
+        return await asyncio.wait_for(fut, timeout=timeout_s)
+
     async def _loop(self):
         while True:
-            items: List[Tuple[
-                asyncio.Future,
-                float,       # t_enqueue
-                np.ndarray,  # float_feats
-                np.ndarray,  # tok_type
-                np.ndarray,  # owner
-                np.ndarray,  # pos
-                np.ndarray,  # subpos
-                np.ndarray,  # entity_id
-                np.ndarray,  # tmask
-                np.ndarray,  # amask
-            ]] = []
-
-
-            # wait for at least one
+            items = []
             try:
                 first = await asyncio.wait_for(self._q.get(), timeout=self.wait_ms / 1000.0)
                 items.append(first)
             except asyncio.TimeoutError:
                 continue
 
-            # drain quickly
             for _ in range(self.max_batch - 1):
                 try:
                     items.append(self._q.get_nowait())
                 except asyncio.QueueEmpty:
                     break
 
-            # small-batch wait to improve batching
             if len(items) < self.min_batch:
                 await asyncio.sleep(self.wait_ms / 1000.0)
                 for _ in range(self.max_batch - len(items)):
@@ -312,54 +256,32 @@ class WorkerInferenceClient:
                     except asyncio.QueueEmpty:
                         break
 
-            ff_b   = np.stack([it[2] for it in items], axis=0).astype(np.float32, copy=False)  # [B,N,F]
-            tt_b   = np.stack([it[3] for it in items], axis=0).astype(np.int64,  copy=False)  # [B,N]
-            own_b  = np.stack([it[4] for it in items], axis=0).astype(np.int64,  copy=False)
-            pos_b  = np.stack([it[5] for it in items], axis=0).astype(np.int64,  copy=False)
-            sub_b  = np.stack([it[6] for it in items], axis=0).astype(np.int64,  copy=False)
-            eid_b  = np.stack([it[7] for it in items], axis=0).astype(np.int64,  copy=False)
-            tmsk_b = np.stack([it[8] for it in items], axis=0).astype(np.float32, copy=False)  # [B,N]
-            amask_b= np.stack([it[9] for it in items], axis=0).astype(np.float32, copy=False)  # [B,A]
+            ff_b   = np.stack([it[1] for it in items], axis=0).astype(np.float32, copy=False)
+            tt_b   = np.stack([it[2] for it in items], axis=0).astype(np.int64,  copy=False)
+            own_b  = np.stack([it[3] for it in items], axis=0).astype(np.int64,  copy=False)
+            pos_b  = np.stack([it[4] for it in items], axis=0).astype(np.int64,  copy=False)
+            sub_b  = np.stack([it[5] for it in items], axis=0).astype(np.int64,  copy=False)
+            eid_b  = np.stack([it[6] for it in items], axis=0).astype(np.int64,  copy=False)
+            tmsk_b = np.stack([it[7] for it in items], axis=0).astype(np.float32, copy=False)
+            amask_b= np.stack([it[8] for it in items], axis=0).astype(np.float32, copy=False)
 
-            # ---------------- STATS: batch + queue depth + queue wait ----------------
-            self.stats.flushes += 1
-            self.stats.last_batch = len(items)
-            if len(items) > self.stats.max_batch:
-                self.stats.max_batch = len(items)
-            
-            qsz = self._q.qsize()
-            if qsz > self.stats.max_qsize:
-                self.stats.max_qsize = qsz
-            
-            t_dispatch = time.perf_counter()
-            for fut, t_enqueue, *_ in items:
-                self.stats.queue_wait_ms_sum += (t_dispatch - t_enqueue) * 1000.0
-                self.stats.queue_wait_n += 1
-            # ------------------------------------------------------------------------
-            
             try:
-                # ---------------- STATS: RPC time (actor call) ----------------
-                t0 = time.perf_counter()
                 ref = self.inference_actor.infer_batch.remote(
                     ff_b, tt_b, own_b, pos_b, sub_b, eid_b, tmsk_b, amask_b
                 )
-                act_b, logp_b, val_b = await ref
-                self.stats.rpc_ms_sum += (time.perf_counter() - t0) * 1000.0
-                self.stats.rpc_n += 1
-                # --------------------------------------------------------------
+                # If your Ray version does NOT support `await ref`, use:
+                # act_b, logp_b, val_b = await asyncio.to_thread(ray.get, ref)
+                act_b, logp_b, val_b = await asyncio.to_thread(ray.get, ref)
             except Exception as e:
-                self.stats.errors += 1
                 for fut, *_ in items:
                     if not fut.done():
                         fut.set_exception(e)
                 raise
 
-            # respond
             for i, (fut, *_rest) in enumerate(items):
                 if fut.done():
                     continue
                 fut.set_result((int(act_b[i]), float(logp_b[i]), float(val_b[i])))
-                self.stats.completed += 1
 
 
 
@@ -383,7 +305,7 @@ class RayBatchedPlayer(Player):
         self.cfg: RunConfig = cfg
         self.obs = cfg.obs
         self.act_dim = int(cfg.env.act_dim)
-
+        self._episode_slot_acquired: set[tuple[int, str]] = set()
         self._traj: Dict[Tuple[int, str], Dict[str, List[Any]]] = {}
     
     def legal_action_mask_and_map(self, battle):
@@ -417,32 +339,38 @@ class RayBatchedPlayer(Player):
                 idx_to_action[a] = ("switch", j)
     
         return mask, idx_to_action
-
-
-
+    
     async def choose_move(self, battle):
-        tb = build_tokens(battle, self.obs)  # TokenBatch, already T_MAX padded
+        tb = build_tokens(battle, self.obs)
         amask, idx_to_action = self.legal_action_mask_and_map(battle)
-        
+    
         bid = battle_id_for(self.agent_id, battle)
         key = (self.agent_id, bid)
         
-        try:
-            a, logp, v = await self.infer_client.request(
-                tb.float_feats, tb.tok_type, tb.owner, tb.pos, tb.subpos, tb.entity_id,
-                tb.attn_mask, amask,
-                timeout_s=self.cfg.rollout.infer_timeout_s,
-            )
-        except Exception as e:
-            print(f"[choose_move] infer failed: {e!r}", flush=True)
-            return self.choose_random_move(battle)
-        
+        if key not in self._episode_slot_acquired:
+            await self.learn_client.acquire_episode_slot()
+            self._episode_slot_acquired.add(key)
+    
+        # Retry forever if inference throws (optional, but aligns with "always wait")
+        while True:
+            try:
+                a, logp, v = await self.infer_client.request(
+                    tb.float_feats, tb.tok_type, tb.owner, tb.pos, tb.subpos, tb.entity_id,
+                    tb.attn_mask, amask,
+                    timeout_s=None,  # <-- no timeout
+                )
+                break
+            except Exception as e:
+                print(f"[choose_move] infer failed (will retry): {e!r}", flush=True)
+                await asyncio.sleep(0.25)
+    
         if key not in self._traj:
             self._traj[key] = {
                 "ff": [], "tt": [], "own": [], "pos": [], "sub": [], "eid": [], "tmask": [],
                 "amask": [], "act": [], "logp": [], "val": []
             }
-        
+    
+        # record step
         self._traj[key]["ff"].append(tb.float_feats)
         self._traj[key]["tt"].append(tb.tok_type)
         self._traj[key]["own"].append(tb.owner)
@@ -450,14 +378,15 @@ class RayBatchedPlayer(Player):
         self._traj[key]["sub"].append(tb.subpos)
         self._traj[key]["eid"].append(tb.entity_id)
         self._traj[key]["tmask"].append(tb.attn_mask)
-        
+    
         self._traj[key]["amask"].append(amask)
         self._traj[key]["act"].append(int(a))
         self._traj[key]["logp"].append(float(logp))
         self._traj[key]["val"].append(float(v))
-
+    
         action = idx_to_action.get(int(a), None)
         if action is None:
+            # If the net picks an illegal action, that’s a modeling/bug issue.
             return self.choose_random_move(battle)
         
         kind = action[0]
@@ -477,9 +406,9 @@ class RayBatchedPlayer(Player):
             return self.create_order(switches[switch_slot])
 
     def _battle_finished_callback(self, battle):
+        bid = battle_id_for(self.agent_id, battle)
+        key = (self.agent_id, bid)
         try:
-            bid = battle_id_for(self.agent_id, battle)
-            key = (self.agent_id, bid)
             buf = self._traj.pop(key, None)
             if not buf or len(buf["act"]) == 0:
                 return super()._battle_finished_callback(battle)
@@ -518,6 +447,7 @@ class RayBatchedPlayer(Player):
 
 
         finally:
+            self._episode_slot_acquired.discard(key)
             try:
                 tag = getattr(battle, "battle_tag", None)
                 if tag is not None:

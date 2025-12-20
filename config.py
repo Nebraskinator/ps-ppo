@@ -267,7 +267,8 @@ class RolloutConfig:
     learn_min_episodes: int = 32
     learn_max_episodes: int = 256
     learn_wait_ms: float = 5.0
-    learn_max_pending_episodes: int = 2000
+    learn_max_pending_episodes: int = 256
+    learn_max_pending_batches: int = 256
 
     def worker_kwargs(self) -> Dict[str, Any]:
         # pass straight into your RolloutWorker/RayBatchedPlayer cfg

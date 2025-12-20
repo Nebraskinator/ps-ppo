@@ -38,7 +38,9 @@ class LearnerActor:
         self.total_episodes = 0
         self.total_steps = 0
 
-        self._q: asyncio.Queue = asyncio.Queue()
+        self._q: asyncio.Queue = asyncio.Queue(
+            maxsize=int(self.run_cfg.rollout.learn_max_pending_batches)
+        )
 
         os.makedirs(self.cfg.ckpt_dir, exist_ok=True)
 
@@ -186,7 +188,7 @@ class LearnerActor:
     def submit_episode(self, tokens, tmask, amask, act, logp, val, rew, done):
         self._q.put_nowait((tokens, tmask, amask, act, logp, val, rew, done))
     
-    def submit_packed_batch(
+    async def submit_packed_batch(
         self,
         ff_cat: np.ndarray,    # [S,N,F]
         tt_cat: np.ndarray,    # [S,N]
@@ -203,8 +205,9 @@ class LearnerActor:
         done_cat: np.ndarray,  # [S]
         lengths: np.ndarray,   # [B]
     ):
-        self._q.put_nowait(("packed", ff_cat, tt_cat, own_cat, pos_cat, sub_cat, eid_cat, tmask_cat,
+        await self._q.put(("packed", ff_cat, tt_cat, own_cat, pos_cat, sub_cat, eid_cat, tmask_cat,
                             amask_cat, act_cat, logp_cat, val_cat, rew_cat, done_cat, lengths))
+        return True
 
 
     # ----------------------------
