@@ -15,13 +15,9 @@ from torch.distributions import Categorical
 # Masked categorical utils
 # ----------------------------
 def masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """
-    logits: [B, A]
-    mask:   [B, A] with {0,1}
-    """
     m = mask.to(dtype=torch.bool)
-    neg = torch.tensor(-1e9, device=logits.device, dtype=logits.dtype)
-    return torch.where(m, logits, neg.expand_as(logits))
+    neg = -1e9 if logits.dtype in (torch.float32, torch.float64) else -1e4
+    return logits.masked_fill(~m, neg)
 
 
 @torch.no_grad()
@@ -303,7 +299,7 @@ class LearnerRollout:
         live = self.live.reshape((-1,))
 
         idx = torch.nonzero(live > 0.5, as_tuple=False).squeeze(-1)
-        idx = idx[torch.randperm(idx.numel(), device=self.device)]
+        idx = idx[torch.randperm(idx.numel(), device=idx.device)]
         for start in range(0, idx.numel(), mb_size):
             mb = idx[start:start + mb_size]
             yield obs[mb], mask[mb], act[mb], logp[mb], val[mb], adv[mb], ret[mb]
@@ -363,7 +359,6 @@ class League:
 # Async episodic dataset for Showdown-style training
 # ============================
 from dataclasses import dataclass
-from typing import Iterable
 
 @dataclass
 class PPOUpdateStats:
@@ -382,6 +377,14 @@ class AsyncEpisodeDataset:
     
     def __len__(self):
         return int(self.n_steps)
+    
+    def _maybe_pin(self, x: torch.Tensor) -> torch.Tensor:
+        return x.pin_memory() if x.device.type == "cpu" else x
+    
+    def swap_out_tensor_cache(self):
+        data = self.tensorize()
+        self.clear()
+        return data
     
     def clear(self):
         self._tensor_cache = None
@@ -429,20 +432,20 @@ class AsyncEpisodeDataset:
         if self._tensor_cache is not None:
             return self._tensor_cache
 
-        float_feats = torch.cat(self.float_feats, dim=0).to(self.device)
-        tok_type    = torch.cat(self.tok_type,    dim=0).to(self.device)
-        owner       = torch.cat(self.owner,       dim=0).to(self.device)
-        pos         = torch.cat(self.pos,         dim=0).to(self.device)
-        subpos      = torch.cat(self.subpos,      dim=0).to(self.device)
-        entity_id   = torch.cat(self.entity_id,   dim=0).to(self.device)
-        tmask       = torch.cat(self.tmask,       dim=0).to(self.device)
-
-        amask  = torch.cat(self.amask,  dim=0).to(self.device)
-        act    = torch.cat(self.act,    dim=0).to(self.device)
-        logp   = torch.cat(self.logp,   dim=0).to(self.device)
-        val    = torch.cat(self.val,    dim=0).to(self.device)
-        adv    = torch.cat(self.adv,    dim=0).to(self.device)
-        ret    = torch.cat(self.ret,    dim=0).to(self.device)
+        float_feats = self._maybe_pin(torch.cat(self.float_feats, dim=0))
+        tok_type    = self._maybe_pin(torch.cat(self.tok_type,    dim=0))
+        owner       = self._maybe_pin(torch.cat(self.owner,       dim=0))
+        pos         = self._maybe_pin(torch.cat(self.pos,         dim=0))
+        subpos      = self._maybe_pin(torch.cat(self.subpos,      dim=0))
+        entity_id   = self._maybe_pin(torch.cat(self.entity_id,   dim=0))
+        tmask       = self._maybe_pin(torch.cat(self.tmask,       dim=0))
+    
+        amask  = self._maybe_pin(torch.cat(self.amask,  dim=0))
+        act    = self._maybe_pin(torch.cat(self.act,    dim=0))
+        logp   = self._maybe_pin(torch.cat(self.logp,   dim=0))
+        val    = self._maybe_pin(torch.cat(self.val,    dim=0))
+        adv    = self._maybe_pin(torch.cat(self.adv,    dim=0))
+        ret    = self._maybe_pin(torch.cat(self.ret,    dim=0))
 
         self._tensor_cache = (float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask, act, logp, val, adv, ret)
         return self._tensor_cache
@@ -514,12 +517,27 @@ def ppo_update(
     """
     PPO update on a flat dataset.
     """
+    dev = next(net.parameters()).device
     kl_sum = clip_sum = ent_sum = v_sum = pg_sum = 0.0
     n_mb = 0
 
     for epoch in range(update_epochs):
         for (mb_ff, mb_tt, mb_own, mb_pos, mb_sub, mb_eid, mb_tmask,
              mb_amask, mb_act, mb_logp_old, mb_val_old, mb_adv, mb_ret) in dataset.iter_minibatches(minibatch_size):
+            
+            mb_ff    = mb_ff.to(dev, non_blocking=True)
+            mb_tt    = mb_tt.to(dev, non_blocking=True)
+            mb_own   = mb_own.to(dev, non_blocking=True)
+            mb_pos   = mb_pos.to(dev, non_blocking=True)
+            mb_sub   = mb_sub.to(dev, non_blocking=True)
+            mb_eid   = mb_eid.to(dev, non_blocking=True)
+            mb_tmask = mb_tmask.to(dev, non_blocking=True)
+            mb_amask = mb_amask.to(dev, non_blocking=True)
+            mb_act   = mb_act.to(dev, non_blocking=True)
+            mb_logp_old = mb_logp_old.to(dev, non_blocking=True)
+            mb_val_old  = mb_val_old.to(dev, non_blocking=True)
+            mb_adv      = mb_adv.to(dev, non_blocking=True)
+            mb_ret      = mb_ret.to(dev, non_blocking=True)
         
             logits, v = net(mb_ff, mb_tt, mb_own, mb_pos, mb_sub, mb_eid, mb_tmask)
             A = logits.shape[-1]

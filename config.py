@@ -300,7 +300,7 @@ class LearnerConfig:
     gae_lambda: float = 0.95
     lr: float = 3e-4
     update_epochs: int = 4
-    minibatch_size: int = 3072
+    minibatch_size: int = 4096
     clip_coef: float = 0.2
     ent_coef: float = 0.01
     vf_coef: float = 0.5

@@ -165,7 +165,7 @@ class LearnerActor:
         return (self.cfg.save_every_updates > 0) and (self.update_idx % self.cfg.save_every_updates == 0)
 
     async def save_now(self, path: Optional[str] = None) -> str:
-        if self.net is None or self.opt is None or self._token_in_dim is None:
+        if self.net is None or self.opt is None:
             raise RuntimeError("Cannot save: model not initialized yet (no episodes seen).")
         if path is None:
             path = self._ckpt_path_for_update(self.update_idx)
@@ -271,28 +271,11 @@ class LearnerActor:
             assert self.net is not None and self.opt is not None
             
             try:
-                ff_u, tt_u, own_u, pos_u, sub_u, eid_u, tmask_u, amask_u, act_u, logp_u, val_u, adv_u, ret_u = self.dataset.tensorize()
-
-    
-                # train on GPU
-                ff_u   = ff_u.to(self.cfg.device)
-                tt_u   = tt_u.to(self.cfg.device)
-                own_u  = own_u.to(self.cfg.device)
-                pos_u  = pos_u.to(self.cfg.device)
-                sub_u  = sub_u.to(self.cfg.device)
-                eid_u  = eid_u.to(self.cfg.device)
-                tmask_u= tmask_u.to(self.cfg.device)
-                amask_u= amask_u.to(self.cfg.device)
-                act_u  = act_u.to(self.cfg.device)
-                logp_u = logp_u.to(self.cfg.device)
-                val_u  = val_u.to(self.cfg.device)
-                adv_u  = adv_u.to(self.cfg.device)
-                ret_u  = ret_u.to(self.cfg.device)
-
+                ff_u, tt_u, own_u, pos_u, sub_u, eid_u, tmask_u, amask_u, act_u, logp_u, val_u, adv_u, ret_u = self.dataset.swap_out_tensor_cache()
     
                 adv_u = (adv_u - adv_u.mean()) / (adv_u.std().clamp_min(1e-8))
     
-                train_ds = AsyncEpisodeDataset(act_dim=self.run_cfg.env.act_dim, device=self.cfg.device)
+                train_ds = AsyncEpisodeDataset(act_dim=self.run_cfg.env.act_dim, device=ff_u.device)
                 train_ds.add_steps(
                     ff_u, tt_u, own_u, pos_u, sub_u, eid_u, tmask_u,
                     amask_u, act_u, logp_u, val_u, adv_u, ret_u
@@ -311,9 +294,6 @@ class LearnerActor:
                 # push weights to inference actor (CPU tensors for Ray)
                 sd_cpu = {k: v.detach().to("cpu") for k, v in self.net.state_dict().items()}
                 self.inference_actor.set_weights.remote(sd_cpu)
-    
-                # clear dataset
-                self.dataset.clear()
     
                 print(
                     f"[learner] upd={self.update_idx} "
