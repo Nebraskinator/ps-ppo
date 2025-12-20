@@ -25,8 +25,23 @@ def masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def masked_sample(logits: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def masked_sample(logits: torch.Tensor, 
+                  mask: torch.Tensor,
+                  greedy: bool = False,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     ml = masked_logits(logits, mask)
+    if greedy:
+        # masked argmax
+        a = torch.argmax(ml, dim=-1)
+
+        # log-prob under the policy (useful for logging)
+        logp = torch.log_softmax(ml, dim=-1).gather(
+            1, a.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # entropy is not meaningful for deterministic choice
+        ent = torch.zeros_like(logp)
+
+        return a, logp, ent
     dist = Categorical(logits=ml)
     a = dist.sample()
     logp = dist.log_prob(a)

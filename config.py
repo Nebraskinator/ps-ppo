@@ -16,36 +16,58 @@ class ObsConfig:
     # Token length / float schema
     # -------------------------
     t_max: int = 128
-    float_dim: int = 80
+    float_dim: int = 112
 
-    # Float feature indices (stable)
+    # ---- Core flags
     F_PRESENT: int = 0
-    F_HP_FRAC: int = 1
+    F_KNOWN: int = 1
     F_FAINTED: int = 2
-    F_BOOST_ATK: int = 3
-    F_BOOST_DEF: int = 4
-    F_BOOST_SPA: int = 5
-    F_BOOST_SPD: int = 6
-    F_BOOST_SPE: int = 7
-    F_BP: int = 8
-    F_ACC: int = 9
-    F_PRIO: int = 10
-    F_PP_FRAC: int = 11
-    F_KNOWN: int = 12
-    F_BOOST_ACC: int = 13
-    F_BOOST_EVAS: int = 14
-    F_POK_TYPE_MH0: int = 15          # 15..32 inclusive (18 dims)
-    F_POK_TERA_TYPE_MH0: int = 33     # 33..50 inclusive (18 dims)
-    F_MOVE_TYPE_MH0: int = 51         # 51..68 inclusive (18 dims)
-    F_MOVE_CAT_OH0: int = 69          # 69..71 inclusive (3 dims)
-    F_STAB: int = 72                  # 1 if move type matches user's type/tera type (best-effort)
-    F_EFF_LOG2: int = 73              # log2(mult) (e.g. -inf..+2); implementation may clamp
-    F_EFF_UNKNOWN: int = 74           # 1 if cannot compute effectiveness
-    F_STAGE_NORM: int = 75
-    F_TURNS_NORM: int = 76
-    F_COUNTER_NORM: int = 77
-    F_POK_TYPE_UNKNOWN: int = 78
-    F_MOVE_TYPE_UNKNOWN: int = 79
+
+    # ---- New: HP as 20-bin one-hot (3..22)
+    F_HP_BIN0: int = 3          # 20 dims: 3..22 inclusive
+
+    # ---- Boosts (7 dims)
+    F_BOOST_ATK: int = 23
+    F_BOOST_DEF: int = 24
+    F_BOOST_SPA: int = 25
+    F_BOOST_SPD: int = 26
+    F_BOOST_SPE: int = 27
+    F_BOOST_ACC: int = 28
+    F_BOOST_EVAS: int = 29
+
+    # ---- Move scalars
+    F_BP: int = 30
+    F_ACC: int = 31
+    F_PRIO: int = 32
+    F_PP_FRAC: int = 33
+
+    # ---- Types
+    F_POK_TYPE_MH0: int = 34          # 34..51 (18 dims)
+    F_POK_TERA_TYPE_MH0: int = 52     # 52..69 (18 dims)
+    F_MOVE_TYPE_MH0: int = 70         # 70..87 (18 dims)
+    F_MOVE_CAT_OH0: int = 88          # 88..90 (3 dims)
+
+    # ---- Combat derived
+    F_STAB: int = 91
+    F_EFF_LOG2: int = 92
+    F_EFF_UNKNOWN: int = 93
+
+    # ---- Effect details
+    F_STAGE_NORM: int = 94
+    F_TURNS_NORM: int = 95
+    F_COUNTER_NORM: int = 96
+
+    # ---- active flag
+    F_IS_ACTIVE: int = 97
+
+    # ---- Optional unknown flags (keep if you still want them)
+    F_POK_TYPE_UNKNOWN: int = 98
+    F_MOVE_TYPE_UNKNOWN: int = 99
+    F_CAN_TERA: int = 100
+    F_IS_TERA: int = 101
+
+    # 100..111 reserved for future use (12 dims of slack)
+
     EFF_MAX_LAYERS: float = 3.0
     EFF_MAX_TURNS: float = 8.0
     EFF_MAX_COUNTER: float = 10.0
@@ -198,8 +220,8 @@ class ObsConfig:
 # -------------------------
 @dataclass(frozen=True)
 class ModelConfig:
-    model_dim: int = 64
-    n_layers: int = 4
+    model_dim: int = 96
+    n_layers: int = 6
     n_heads: int = 1
     ff_mult: int = 4
     dropout: float = 0.0
@@ -220,7 +242,7 @@ class ModelConfig:
 @dataclass(frozen=True)
 class EnvConfig:
     battle_format: str = "gen9randombattle"
-    act_dim: int = 10  # 4 moves + 6 switches
+    act_dim: int = 14  # 4 moves + 4 tera moves + 6 switches
 
 
 # -------------------------
@@ -277,7 +299,7 @@ class LearnerConfig:
     gae_lambda: float = 0.95
     lr: float = 3e-4
     update_epochs: int = 4
-    minibatch_size: int = 3072
+    minibatch_size: int = 2048
     clip_coef: float = 0.2
     ent_coef: float = 0.01
     vf_coef: float = 0.5

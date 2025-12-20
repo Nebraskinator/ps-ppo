@@ -295,28 +295,39 @@ class RayBatchedPlayer(Player):
         self.act_dim = int(cfg.env.act_dim)
 
         self._traj: Dict[Tuple[int, str], Dict[str, List[Any]]] = {}
-
+    
     def legal_action_mask_and_map(self, battle):
         mask = np.zeros((self.act_dim,), dtype=np.float32)
-        idx_to_action: Dict[int, Any] = {}
+        idx_to_action: Dict[int, tuple] = {}
     
-        moves = list(battle.available_moves)[:4]
-        switches = list(battle.available_switches)[:6]
+        moves = list(battle.available_moves)
+        switches = list(battle.available_switches)
     
-        for i, mv in enumerate(moves):
-            if i >= self.act_dim:
-                break
-            mask[i] = 1.0
-            idx_to_action[i] = mv
+        can_tera = bool(getattr(battle, "can_tera", False))
     
-        for j, sw in enumerate(switches):
-            a = 4 + j
-            if a >= self.act_dim:
-                break
-            mask[a] = 1.0
-            idx_to_action[a] = sw
+        # ---- Moves ----
+        for i in range(4):
+            if i < len(moves):
+                # normal move
+                mask[i] = 1.0
+                idx_to_action[i] = ("move", i, False)
+    
+                # tera move
+                tera_idx = 4 + i
+                if can_tera and tera_idx < self.act_dim:
+                    mask[tera_idx] = 1.0
+                    idx_to_action[tera_idx] = ("move", i, True)
+    
+        # ---- Switches ----
+        base = 8
+        for j in range(6):
+            a = base + j
+            if a < self.act_dim and j < len(switches):
+                mask[a] = 1.0
+                idx_to_action[a] = ("switch", j)
     
         return mask, idx_to_action
+
 
 
     async def choose_move(self, battle):
@@ -355,11 +366,25 @@ class RayBatchedPlayer(Player):
         self._traj[key]["logp"].append(float(logp))
         self._traj[key]["val"].append(float(v))
 
-
-        action_obj = idx_to_action.get(int(a), None)
-        if action_obj is None:
+        action = idx_to_action.get(int(a), None)
+        if action is None:
             return self.choose_random_move(battle)
-        return self.create_order(action_obj)
+        
+        kind = action[0]
+        
+        if kind == "move":
+            _, move_slot, use_tera = action
+            moves = list(battle.available_moves)
+            if move_slot >= len(moves):
+                return self.choose_random_move(battle)
+            return self.create_order(moves[move_slot], terastallize=use_tera)
+        
+        elif kind == "switch":
+            _, switch_slot = action
+            switches = list(battle.available_switches)
+            if switch_slot >= len(switches):
+                return self.choose_random_move(battle)
+            return self.create_order(switches[switch_slot])
 
     def _battle_finished_callback(self, battle):
         try:

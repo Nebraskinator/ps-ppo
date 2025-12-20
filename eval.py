@@ -17,7 +17,7 @@ from poke_env.player import Player
 
 from config import RunConfig
 from showdown_obs import build_tokens  # must match training (TokenBatch w/ ff, tt, own, pos, subpos, eid, attn_mask)
-from ppo_core import masked_sample     # must match training sampling
+from ppo_core import masked_sample     
 
 
 def latest_ckpt_path(ckpt_dir: str) -> str:
@@ -109,7 +109,7 @@ class LoadedPolicy:
         am   = torch.from_numpy(amask[None, ...]).to(self.device, dtype=torch.float32)
 
         logits, value = self.net(ff, tt, own, pos, sub, eid, tmsk)  # [1,A], [1]
-        a_t, logp_t, _ent = masked_sample(logits, am)
+        a_t, logp_t, _ent = masked_sample(logits, am, greedy=True)
 
         a_idx = int(a_t.item())
         logp = float(logp_t.item())

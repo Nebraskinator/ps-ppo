@@ -743,6 +743,18 @@ def _hp_frac01(pokemon) -> float:
     except Exception:
         return 0.0
 
+def _set_hp_bin20(fv: np.ndarray, base_idx: int, hp_frac: float) -> None:
+    """
+    One-hot encode HP fraction into 20 bins by rounding to nearest bin.
+    Bins represent values in [0..1], index 0 = 0%, index 19 = 100%.
+    """
+    # hp_frac already clamped [0,1]
+    b = int(round(float(hp_frac) * 19.0))
+    if b < 0: b = 0
+    if b > 19: b = 19
+    j = base_idx + b
+    if 0 <= j < fv.shape[0]:
+        fv[j] = 1.0
 
 def _pokemon_types(pokemon) -> Tuple[Optional[str], Optional[str]]:
     """
@@ -839,12 +851,78 @@ def _effect_details(raw_val: Any) -> Tuple[Optional[float], Optional[float], Opt
 
     return stage, turns, counter
 
-
 def _norm_with_cap(x: Optional[float], cap: float) -> float:
     if x is None or cap <= 0:
         return 0.0
     return _clamp01(float(x) / float(cap))
 
+def _iter_team_pokemon(team_obj: Any) -> List[Any]:
+    """
+    Returns a stable list of pokemon objects from poke-env team containers.
+    Handles:
+      - dict: {ident -> Pokemon}
+      - list/tuple/set: iterable of Pokemon
+      - None/unknown: []
+    """
+    if team_obj is None:
+        return []
+    if isinstance(team_obj, dict):
+        return list(team_obj.values())
+    if isinstance(team_obj, (list, tuple)):
+        return list(team_obj)
+    # sometimes it's a set-like container
+    try:
+        return list(team_obj)
+    except Exception:
+        return []
+
+
+def _ordered_team(
+    active: Any,
+    primary: List[Any],
+    fill: List[Any],
+    n_slots: int,
+) -> List[Any]:
+    """
+    Enforce:
+      pos=0 is active (if known)
+      pos=1.. come from `primary` (excluding active), in order
+      then fill from `fill` (excluding duplicates), in order
+      pad with None to n_slots
+    """
+    out: List[Any] = []
+
+    if active is not None:
+        out.append(active)
+
+    def add_list(xs: List[Any]):
+        for p in xs:
+            if p is None:
+                continue
+            if active is not None and _same_pokemon(p, active):
+                continue
+            if not any(_same_pokemon(p, q) for q in out):
+                out.append(p)
+            if len(out) >= n_slots:
+                break
+
+    add_list(primary)
+    add_list(fill)
+
+    out += [None] * (n_slots - len(out))
+    return out[:n_slots]
+
+
+def _same_pokemon(a: Any, b: Any) -> bool:
+    if a is None or b is None:
+        return False
+    # poke-env often reuses the same object instances; this is best-case.
+    if a is b:
+        return True
+    # fallback identity-ish match
+    sa = (_safe_get(a, "species", None), _safe_get(a, "name", None), _safe_get(a, "level", None))
+    sb = (_safe_get(b, "species", None), _safe_get(b, "name", None), _safe_get(b, "level", None))
+    return sa == sb and sa[0] is not None
 
 # ============================================================
 # Token builders
@@ -858,6 +936,9 @@ def _pokemon_token(pokemon, owner: int, slot: int, obs: ObsConfig) -> Tuple[int,
 
     fv[obs.F_PRESENT] = 1.0 if present else 0.0
     fv[obs.F_KNOWN] = 1.0 if revealed else 0.0
+    
+    is_tera = bool(_safe_get(pokemon, "is_terastallized", False))
+    fv[obs.F_IS_TERA] = 1.0 if is_tera else 0.0
 
     if pokemon is None:
         return obs.ENTITY_NONE, fv
@@ -865,7 +946,8 @@ def _pokemon_token(pokemon, owner: int, slot: int, obs: ObsConfig) -> Tuple[int,
     if not revealed:
         return obs.SPECIES_UNK, fv
 
-    fv[obs.F_HP_FRAC] = _hp_frac01(pokemon)
+    hp = _hp_frac01(pokemon)
+    _set_hp_bin20(fv, obs.F_HP_BIN0, hp)
     fv[obs.F_FAINTED] = 1.0 if bool(_safe_get(pokemon, "fainted", False)) else 0.0
 
     ba, bd, bs, bp, be, bacc, beva = _boosts11(pokemon)
@@ -975,21 +1057,33 @@ def _move_token(
     ent = move_entity_id(mid, obs)
     return ent, fv
 
+def _move_token_unknown(obs: ObsConfig) -> Tuple[int, np.ndarray]:
+    fv = _new_float(obs)
+    fv[obs.F_PRESENT] = 1.0
+    fv[obs.F_KNOWN] = 0.0
+    return obs.MOVES_UNK, fv
+
+def _move_token_empty(obs: ObsConfig) -> Tuple[int, np.ndarray]:
+    fv = _new_float(obs)
+    fv[obs.F_PRESENT] = 0.0
+    fv[obs.F_KNOWN] = 0.0
+    return obs.ENTITY_NONE, fv
 
 def _item_token(item_name: Optional[str], is_known: bool, obs: ObsConfig) -> Tuple[int, np.ndarray]:
     fv = _new_float(obs)
-    fv[obs.F_PRESENT] = 1.0 if is_known else 0.0
+    fv[obs.F_PRESENT] = 1.0  # token exists in fixed grid
     fv[obs.F_KNOWN] = 1.0 if is_known else 0.0
-    ent = item_entity_id(item_name, obs) if is_known else obs.ENTITY_NONE
+    ent = item_entity_id(item_name, obs) if is_known else obs.ITEMS_UNK
     return ent, fv
 
 
 def _ability_token(ability_name: Optional[str], is_known: bool, obs: ObsConfig) -> Tuple[int, np.ndarray]:
     fv = _new_float(obs)
-    fv[obs.F_PRESENT] = 1.0 if is_known else 0.0
+    fv[obs.F_PRESENT] = 1.0
     fv[obs.F_KNOWN] = 1.0 if is_known else 0.0
-    ent = ability_entity_id(ability_name, obs) if is_known else obs.ENTITY_NONE
+    ent = ability_entity_id(ability_name, obs) if is_known else obs.ABIL_UNK
     return ent, fv
+
 
 
 def _apply_effect_float_details(fv: np.ndarray, obs: ObsConfig, raw_val: Any) -> None:
@@ -1030,7 +1124,14 @@ def build_tokens(battle, obs: ObsConfig) -> TokenBatch:
     subposes: List[int] = []
     ent_ids: List[int] = []
 
-    def _append(tt: int, owner: int, pos: int, subpos: int, entity_id: int, fv: Optional[np.ndarray] = None):
+    def _append(
+        tt: int,
+        owner: int,
+        pos: int,
+        subpos: int,
+        entity_id: int,
+        fv: Optional[np.ndarray] = None,
+    ):
         if fv is None:
             fv = _new_float(obs)
         floats.append(fv.astype(np.float32, copy=False))
@@ -1040,112 +1141,149 @@ def build_tokens(battle, obs: ObsConfig) -> TokenBatch:
         subposes.append(int(subpos))
         ent_ids.append(int(entity_id))
 
-    # -------- CLS --------
+    # ---------------- CLS ----------------
     _append(obs.TT_CLS, obs.OWNER_NONE, obs.POS_NA, obs.SUBPOS_NA, obs.ENTITY_NONE, _new_float(obs))
 
-    # -------- Teams (fixed 12 pokemon tokens) --------
-    team_dict = _safe_get(battle, "team", {}) or {}
-    opp_dict = _safe_get(battle, "opponent_team", {}) or {}
+    # ---------------- Teams (pokemon tokens) ----------------
+    team_obj = _safe_get(battle, "team", None)
+    opp_obj = _safe_get(battle, "opponent_team", None)
 
-    self_team = list(team_dict.values())[: obs.n_slots] if isinstance(team_dict, dict) else []
-    opp_team = list(opp_dict.values())[: obs.n_slots] if isinstance(opp_dict, dict) else []
+    team_all = _iter_team_pokemon(team_obj)
+    opp_all = _iter_team_pokemon(opp_obj)
 
-    self_team += [None] * (obs.n_slots - len(self_team))
-    opp_team += [None] * (obs.n_slots - len(opp_team))
+    raw_self_active = _safe_get(battle, "active_pokemon", None)
+    raw_opp_active = _safe_get(battle, "opponent_active_pokemon", None)
+
+    # Self: primary order = available_switches (aligns with switch actions)
+    avail_switches = list(_safe_get(battle, "available_switches", []) or [])
+    self_team = _ordered_team(
+        active=raw_self_active,
+        primary=avail_switches,
+        fill=team_all,
+        n_slots=obs.n_slots,
+    )
+
+    # Opp: enforce active first; then opponent_team order
+    opp_team = _ordered_team(
+        active=raw_opp_active,
+        primary=[],
+        fill=opp_all,
+        n_slots=obs.n_slots,
+    )
+
+    # These are the ONLY "actives" we use downstream
+    self_active = self_team[0] if len(self_team) > 0 else None
+    opp_active = opp_team[0] if len(opp_team) > 0 else None
 
     for i, p in enumerate(self_team):
         ent, fv = _pokemon_token(p, obs.OWNER_SELF, i, obs)
+        if i == 0 and p is not None:
+            fv[obs.F_IS_ACTIVE] = 1.0
+            fv[obs.F_CAN_TERA] = 1.0 if bool(_safe_get(battle, "can_tera", False)) else 0.0
         _append(obs.TT_POK, obs.OWNER_SELF, i, obs.SUBPOS_NA, ent, fv)
 
     for i, p in enumerate(opp_team):
         ent, fv = _pokemon_token(p, obs.OWNER_OPP, i, obs)
+        if i == 0 and p is not None:
+            fv[obs.F_IS_ACTIVE] = 1.0
         _append(obs.TT_POK, obs.OWNER_OPP, i, obs.SUBPOS_NA, ent, fv)
 
-    # -------- Battlefield anchor token --------
+    # ---------------- Battlefield anchor ----------------
     _append(obs.TT_BF, obs.OWNER_NONE, obs.POS_NA, obs.SUBPOS_NA, obs.ENTITY_NONE, _new_float(obs))
 
-    # Active mons for STAB/eff calcs
-    self_active = _safe_get(battle, "active_pokemon", None)
-    opp_active = _safe_get(battle, "opponent_active_pokemon", None)
+    # ---------------- Fixed grids: MOVES / ITEMS / ABILITIES ----------------
+    def _extract_known_moves(pkm) -> List[Any]:
+        if pkm is None:
+            return []
+        mv_dict = _safe_get(pkm, "moves", None)
+        if isinstance(mv_dict, dict) and mv_dict:
+            return list(mv_dict.values())
+        mk = _safe_get(pkm, "moves_known", None)
+        if isinstance(mk, list) and mk:
+            return mk
+        return []
 
-    # -------- Self active moves (fixed to 4 slots) --------
-    avail_moves = list(_safe_get(battle, "available_moves", []) or [])[: obs.n_move_slots]
-    for j in range(obs.n_move_slots):
-        mv = avail_moves[j] if j < len(avail_moves) else None
-        ent, fv = _move_token(
-            mv,
-            obs.OWNER_SELF,
-            slot=0,
-            move_slot=j,
-            obs=obs,
-            user_active_pokemon=self_active,
-            opp_active_pokemon=opp_active,
-        )
-        _append(obs.TT_MOVE, obs.OWNER_SELF, 0, j, ent, fv)
+    def _emit_move_grid(team: List[Any], owner: int, opp_active_for_eff: Any):
+        """
+        Exactly obs.n_slots * obs.n_move_slots move tokens for this owner.
+          - empty pokemon slot => ENTITY_NONE / present=0
+          - pokemon present but move unknown => MOVES_UNK / present=1, known=0
+          - move known => populated via _move_token
+        """
+        for i, p in enumerate(team):
+            if p is None:
+                for j in range(obs.n_move_slots):
+                    ent, fv = _move_token_empty(obs)
+                    _append(obs.TT_MOVE, owner, i, j, ent, fv)
+                continue
 
-    # -------- Opponent known moves (active only) --------
-    if opp_active is not None:
-        known: List[Any] = []
-        mv_dict = _safe_get(opp_active, "moves", None)
-        if isinstance(mv_dict, dict):
-            known = list(mv_dict.values())
-        else:
-            mk = _safe_get(opp_active, "moves_known", None)
-            if isinstance(mk, list):
-                known = mk
+            known = _extract_known_moves(p)
+            for j in range(obs.n_move_slots):
+                if j < len(known) and known[j] is not None:
+                    ent, fv = _move_token(
+                        known[j],
+                        owner,
+                        slot=i,
+                        move_slot=j,
+                        obs=obs,
+                        user_active_pokemon=p,
+                        opp_active_pokemon=opp_active_for_eff,
+                    )
+                else:
+                    ent, fv = _move_token_unknown(obs)
+                _append(obs.TT_MOVE, owner, i, j, ent, fv)
 
-        for j in range(min(obs.n_move_slots, len(known))):
-            mv = known[j]
-            ent, fv = _move_token(
-                mv,
-                obs.OWNER_OPP,
-                slot=0,
-                move_slot=j,
-                obs=obs,
-                user_active_pokemon=opp_active,   # opponent is "user" for their own STAB
-                opp_active_pokemon=self_active,   # vs our active typing
-            )
-            _append(obs.TT_MOVE, obs.OWNER_OPP, 0, j, ent, fv)
+    def _emit_item_grid(team: List[Any], owner: int):
+        """
+        Exactly obs.n_slots item tokens for this owner.
+          - empty pokemon slot => ENTITY_NONE / present=0
+          - pokemon present but item unknown => ITEMS_UNK / present=1, known=0
+          - item known => populated via _item_token
+        """
+        for i, p in enumerate(team):
+            if p is None:
+                fv = _new_float(obs)
+                fv[obs.F_PRESENT] = 0.0
+                fv[obs.F_KNOWN] = 0.0
+                _append(obs.TT_ITEM, owner, i, obs.SUBPOS_NA, obs.ENTITY_NONE, fv)
+                continue
 
-    # -------- Item tokens (per pokemon when known) --------
-    for i, p in enumerate(self_team):
-        if p is None:
-            continue
-        it = _norm_name(_safe_get(p, "item", None))
-        if it is None:
-            continue
-        ent, fv = _item_token(it, is_known=True, obs=obs)
-        _append(obs.TT_ITEM, obs.OWNER_SELF, i, obs.SUBPOS_NA, ent, fv)
+            it = _norm_name(_safe_get(p, "item", None))
+            is_known = it is not None
+            ent, fv = _item_token(it, is_known=is_known, obs=obs)
+            _append(obs.TT_ITEM, owner, i, obs.SUBPOS_NA, ent, fv)
 
-    for i, p in enumerate(opp_team):
-        if p is None:
-            continue
-        it = _norm_name(_safe_get(p, "item", None))
-        if it is None:
-            continue
-        ent, fv = _item_token(it, is_known=True, obs=obs)
-        _append(obs.TT_ITEM, obs.OWNER_OPP, i, obs.SUBPOS_NA, ent, fv)
+    def _emit_ability_grid(team: List[Any], owner: int):
+        """
+        Exactly obs.n_slots ability tokens for this owner.
+          - empty pokemon slot => ENTITY_NONE / present=0
+          - pokemon present but ability unknown => ABIL_UNK / present=1, known=0
+          - ability known => populated via _ability_token
+        """
+        for i, p in enumerate(team):
+            if p is None:
+                fv = _new_float(obs)
+                fv[obs.F_PRESENT] = 0.0
+                fv[obs.F_KNOWN] = 0.0
+                _append(obs.TT_ABILITY, owner, i, obs.SUBPOS_NA, obs.ENTITY_NONE, fv)
+                continue
 
-    # -------- Ability tokens (per pokemon when known) --------
-    for i, p in enumerate(self_team):
-        if p is None:
-            continue
-        ab = _norm_name(_safe_get(p, "ability", None))
-        if ab is None:
-            continue
-        ent, fv = _ability_token(ab, is_known=True, obs=obs)
-        _append(obs.TT_ABILITY, obs.OWNER_SELF, i, obs.SUBPOS_NA, ent, fv)
+            ab = _norm_name(_safe_get(p, "ability", None))
+            is_known = ab is not None
+            ent, fv = _ability_token(ab, is_known=is_known, obs=obs)
+            _append(obs.TT_ABILITY, owner, i, obs.SUBPOS_NA, ent, fv)
 
-    for i, p in enumerate(opp_team):
-        if p is None:
-            continue
-        ab = _norm_name(_safe_get(p, "ability", None))
-        if ab is None:
-            continue
-        ent, fv = _ability_token(ab, is_known=True, obs=obs)
-        _append(obs.TT_ABILITY, obs.OWNER_OPP, i, obs.SUBPOS_NA, ent, fv)
+    # Emit fixed grids for BOTH sides
+    _emit_move_grid(self_team, obs.OWNER_SELF, opp_active)
+    _emit_move_grid(opp_team, obs.OWNER_OPP, self_active)
 
-    # -------- Volatile effects on active mons (Observed-effect vocab) --------
+    _emit_item_grid(self_team, obs.OWNER_SELF)
+    _emit_item_grid(opp_team, obs.OWNER_OPP)
+
+    _emit_ability_grid(self_team, obs.OWNER_SELF)
+    _emit_ability_grid(opp_team, obs.OWNER_OPP)
+
+    # ---------------- Volatile effects on active mons ----------------
     def emit_effects_for(pokemon, owner: int, slot: int):
         if pokemon is None:
             return
@@ -1154,13 +1292,21 @@ def build_tokens(battle, obs: ObsConfig) -> TokenBatch:
             return
 
         if isinstance(eff, dict):
-            items = list(eff.items())
+            raw_items = list(eff.items())
         elif isinstance(eff, list):
-            items = [(x, None) for x in eff]
+            raw_items = [(x, None) for x in eff]
         else:
             return
 
-        for k, v in items:
+        # deterministic ordering
+        def _key_str(k: Any) -> str:
+            ck = _canon_obs_effect_key(k)
+            return ck or str(k)
+
+        # keep deterministic ordering if you want
+        items = sorted(raw_items, key=lambda kv: _key_str(kv[0]))
+        
+        for (k, v) in items:
             eid = effect_entity_id_from_obs(k, obs)
             if eid == obs.ENTITY_NONE:
                 continue
@@ -1168,16 +1314,31 @@ def build_tokens(battle, obs: ObsConfig) -> TokenBatch:
             fv[obs.F_PRESENT] = 1.0
             fv[obs.F_KNOWN] = 1.0
             _apply_effect_float_details(fv, obs, v)
+        
+            # subpos is NA because effects are an unordered set
             _append(obs.TT_EFF, owner, slot, obs.SUBPOS_NA, eid, fv)
 
+
+    # IMPORTANT: use ordered actives (pos=0)
     emit_effects_for(self_active, obs.OWNER_SELF, 0)
     emit_effects_for(opp_active, obs.OWNER_OPP, 0)
 
-    # -------- Side conditions / fields / weather (Observed-effect vocab) --------
+    # ---------------- Side conditions / fields / weather ----------------
     def emit_dict_keys(d, tt: int, owner: int):
-        if not isinstance(d, dict):
+        if not isinstance(d, dict) or not d:
             return
-        for k, v in d.items():
+
+        # deterministic ordering
+        def _key_str(k: Any) -> str:
+            ck = _canon_obs_effect_key(k)
+            return ck or str(k)
+
+        items = sorted(list(d.items()), key=lambda kv: _key_str(kv[0]))
+
+        # subpos must be in-range [0..3], so cap to 4 as well
+        items = items[: obs.n_move_slots]
+
+        for j, (k, v) in enumerate(items):
             eid = effect_entity_id_from_obs(k, obs)
             if eid == obs.ENTITY_NONE:
                 continue
@@ -1185,23 +1346,29 @@ def build_tokens(battle, obs: ObsConfig) -> TokenBatch:
             fv[obs.F_PRESENT] = 1.0
             fv[obs.F_KNOWN] = 1.0
             _apply_effect_float_details(fv, obs, v)
-            _append(tt, owner, obs.POS_NA, obs.SUBPOS_NA, eid, fv)
 
+            # Put battlefield-ish things at pos=0 (a valid pos), subpos=j
+            _append(tt, owner, 0, j, eid, fv)
+
+    # Side conditions: owner identifies side
     emit_dict_keys(_safe_get(battle, "side_conditions", None), obs.TT_SC, obs.OWNER_SELF)
     emit_dict_keys(_safe_get(battle, "opponent_side_conditions", None), obs.TT_SC, obs.OWNER_OPP)
+
+    # Fields
     emit_dict_keys(_safe_get(battle, "fields", None), obs.TT_FIELD, obs.OWNER_NONE)
 
-    # weather can be str/enum/dict depending on poke-env; effect_entity_id_from_obs handles dict/enum
+    # Weather: sometimes dict/enum/str
     w = _safe_get(battle, "weather", None)
-    if w:
+    if isinstance(w, dict):
+        emit_dict_keys(w, obs.TT_FIELD, obs.OWNER_NONE)
+    elif w:
         eid = effect_entity_id_from_obs(w, obs)
         if eid != obs.ENTITY_NONE:
             fv = _new_float(obs)
             fv[obs.F_PRESENT] = 1.0
             fv[obs.F_KNOWN] = 1.0
-            # weather often includes turn counters in dict form handled inside canon/emit_dict_keys,
-            # but if it's a bare enum/string, we don't have details here.
-            _append(obs.TT_FIELD, obs.OWNER_NONE, obs.POS_NA, obs.SUBPOS_NA, eid, fv)
+            # Reserve subpos=0 lane for single weather token
+            _append(obs.TT_FIELD, obs.OWNER_NONE, 0, 0, eid, fv)
 
     out = TokenBatch(
         float_feats=np.stack(floats, axis=0).astype(np.float32),
@@ -1213,3 +1380,4 @@ def build_tokens(battle, obs: ObsConfig) -> TokenBatch:
         attn_mask=np.ones((len(floats),), dtype=np.float32),
     )
     return pad_or_truncate(out, obs)
+
