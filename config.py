@@ -220,8 +220,8 @@ class ObsConfig:
 # -------------------------
 @dataclass(frozen=True)
 class ModelConfig:
-    model_dim: int = 96
-    n_layers: int = 6
+    model_dim: int = 64
+    n_layers: int = 4
     n_heads: int = 1
     ff_mult: int = 4
     dropout: float = 0.0
@@ -251,17 +251,17 @@ class EnvConfig:
 @dataclass(frozen=True)
 class RolloutConfig:
     
-    target_concurrent_battles: int = 4096
+    target_concurrent_battles: int = 3072
     rooms_per_pair: int = 16
 
-    infer_timeout_s: float = 5.0
+    infer_timeout_s: float = 15.0
     open_timeout: float = 30.0
     ping_interval: float = 20.0
     ping_timeout: float = 20.0
 
-    infer_min_batch: int = 256
-    infer_max_batch: int = 4096
-    infer_wait_ms: float = 2.0
+    infer_min_batch: int = 32
+    infer_max_batch: int = 1024
+    infer_wait_ms: float = 1.0
     infer_max_pending: int = 20000
 
     learn_min_episodes: int = 32
@@ -299,7 +299,7 @@ class LearnerConfig:
     gae_lambda: float = 0.95
     lr: float = 3e-4
     update_epochs: int = 4
-    minibatch_size: int = 2048
+    minibatch_size: int = 3072
     clip_coef: float = 0.2
     ent_coef: float = 0.01
     vf_coef: float = 0.5

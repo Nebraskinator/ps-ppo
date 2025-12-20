@@ -15,7 +15,7 @@ from worker import RolloutWorker
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-SERVER_PORTS = [8000, 8001, 8002, 8003, 8004, 8005, 8006, 8007]
+SERVER_PORTS = [8000, 8001, 8002, 8003, 8004, 8005, ]#8006, 8007]
 
 
 async def main():

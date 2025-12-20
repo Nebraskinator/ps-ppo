@@ -1203,12 +1203,12 @@ def build_tokens(battle, obs: ObsConfig) -> TokenBatch:
             return mk
         return []
 
-    def _emit_move_grid(team: List[Any], owner: int, opp_active_for_eff: Any):
+    def _emit_move_grid(team: List[Any], owner: int, opp_active_for_eff: Any, battle_obj=None):
         """
         Exactly obs.n_slots * obs.n_move_slots move tokens for this owner.
-          - empty pokemon slot => ENTITY_NONE / present=0
-          - pokemon present but move unknown => MOVES_UNK / present=1, known=0
-          - move known => populated via _move_token
+        For the ACTIVE slot (i==0), we emit moves in the SAME order as action masking:
+          battle.available_moves[0..3]
+        For non-active slots, fall back to known moves.
         """
         for i, p in enumerate(team):
             if p is None:
@@ -1216,12 +1216,24 @@ def build_tokens(battle, obs: ObsConfig) -> TokenBatch:
                     ent, fv = _move_token_empty(obs)
                     _append(obs.TT_MOVE, owner, i, j, ent, fv)
                 continue
-
-            known = _extract_known_moves(p)
+    
+            # --- choose ordering source ---
+            use_action_order = (
+                (battle_obj is not None)
+                and (owner == obs.OWNER_SELF)  # only YOUR action space
+                and (i == 0)                   # only active mon has available_moves
+            )
+    
+            if use_action_order:
+                ordered_moves = list(_safe_get(battle_obj, "available_moves", []) or [])
+            else:
+                ordered_moves = _extract_known_moves(p)
+    
+            # --- emit fixed 4 slots ---
             for j in range(obs.n_move_slots):
-                if j < len(known) and known[j] is not None:
+                if j < len(ordered_moves) and ordered_moves[j] is not None:
                     ent, fv = _move_token(
-                        known[j],
+                        ordered_moves[j],
                         owner,
                         slot=i,
                         move_slot=j,
@@ -1232,6 +1244,7 @@ def build_tokens(battle, obs: ObsConfig) -> TokenBatch:
                 else:
                     ent, fv = _move_token_unknown(obs)
                 _append(obs.TT_MOVE, owner, i, j, ent, fv)
+
 
     def _emit_item_grid(team: List[Any], owner: int):
         """
@@ -1274,7 +1287,7 @@ def build_tokens(battle, obs: ObsConfig) -> TokenBatch:
             _append(obs.TT_ABILITY, owner, i, obs.SUBPOS_NA, ent, fv)
 
     # Emit fixed grids for BOTH sides
-    _emit_move_grid(self_team, obs.OWNER_SELF, opp_active)
+    _emit_move_grid(self_team, obs.OWNER_SELF, opp_active, battle_obj=battle)
     _emit_move_grid(opp_team, obs.OWNER_OPP, self_active)
 
     _emit_item_grid(self_team, obs.OWNER_SELF)
