@@ -432,13 +432,15 @@ class RayBatchedPlayer(Player):
             done = np.zeros((T,), dtype=np.float32)
             done[-1] = 1.0
             
-            prev_self, prev_opp = count_faints_from_float_feats(ff[0], self.obs)
-            for t in range(1, T):
-                cur_self, cur_opp = count_faints_from_float_feats(ff[t], self.obs)
-                delta_opp  = max(0, cur_opp - prev_opp)
-                delta_self = max(0, cur_self - prev_self)
-                rew[t] = float(delta_opp - delta_self)
-                prev_self, prev_opp = cur_self, cur_opp
+            won = getattr(battle, "won", None)
+            lost = getattr(battle, "lost", None)
+            
+            terminal = 0.0
+            if won is True:
+                terminal = 1.0
+            elif lost is True:
+                terminal = -1.0
+            rew[-1] = terminal
             
             self.learn_client.submit_episode(
                 ff, tt, own, pos, sub, eid, tmsk,

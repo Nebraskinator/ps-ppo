@@ -317,6 +317,22 @@ def _log2_eff(mult: float) -> float:
         return -3.0
     return float(_clamp11(math.log(mult, 2) / 3.0) * 3.0)  # keep roughly in [-3, +3]
 
+def _set_oh_bin(fv: np.ndarray, base_idx: int, x: Optional[float], bins: int, cap: float) -> None:
+    if x is None or bins <= 0 or cap <= 0:
+        return
+    v = float(x)
+    if v < 0:
+        v = 0.0
+    if v > cap:
+        v = cap
+    # map [0..cap] -> [0..bins-1]
+    b = int((v / cap) * (bins - 1) + 1e-9)
+    if b < 0: b = 0
+    if b >= bins: b = bins - 1
+    j = base_idx + b
+    if 0 <= j < fv.shape[0]:
+        fv[j] = 1.0
+
 
 # ============================================================
 # Local Showdown TS vocab
@@ -949,6 +965,32 @@ def _pokemon_token(pokemon, owner: int, slot: int, obs: ObsConfig) -> Tuple[int,
     hp = _hp_frac01(pokemon)
     _set_hp_bin20(fv, obs.F_HP_BIN0, hp)
     fv[obs.F_FAINTED] = 1.0 if bool(_safe_get(pokemon, "fainted", False)) else 0.0
+    
+    # --- Level bins
+    lvl = _safe_get(pokemon, "level", None)
+    if lvl is not None:
+        _set_oh_bin(fv, obs.F_LEVEL_BIN0, float(lvl), bins=obs.LEVEL_BINS, cap=100.0)
+    
+    # --- Base stats bins (always available if revealed in your dump)
+    bs = _safe_get(pokemon, "base_stats", None)
+    if isinstance(bs, dict):
+        _set_oh_bin(fv, obs.F_BASE_HP_BIN0,  bs.get("hp", None),  bins=obs.STAT_BINS, cap=255.0)
+        _set_oh_bin(fv, obs.F_BASE_ATK_BIN0, bs.get("atk", None), bins=obs.STAT_BINS, cap=255.0)
+        _set_oh_bin(fv, obs.F_BASE_DEF_BIN0, bs.get("def", None), bins=obs.STAT_BINS, cap=255.0)
+        _set_oh_bin(fv, obs.F_BASE_SPA_BIN0, bs.get("spa", None), bins=obs.STAT_BINS, cap=255.0)
+        _set_oh_bin(fv, obs.F_BASE_SPD_BIN0, bs.get("spd", None), bins=obs.STAT_BINS, cap=255.0)
+        _set_oh_bin(fv, obs.F_BASE_SPE_BIN0, bs.get("spe", None), bins=obs.STAT_BINS, cap=255.0)
+    
+    # --- Observed computed stats bins (only if present; opponent often None)
+    st = _safe_get(pokemon, "stats", None)
+    if isinstance(st, dict):
+        _set_oh_bin(fv, obs.F_STAT_HP_BIN0,  st.get("hp", None),  bins=obs.STAT_BINS, cap=float(obs.HP_STAT_CAP))
+        _set_oh_bin(fv, obs.F_STAT_ATK_BIN0, st.get("atk", None), bins=obs.STAT_BINS, cap=float(obs.OTHER_STAT_CAP))
+        _set_oh_bin(fv, obs.F_STAT_DEF_BIN0, st.get("def", None), bins=obs.STAT_BINS, cap=float(obs.OTHER_STAT_CAP))
+        _set_oh_bin(fv, obs.F_STAT_SPA_BIN0, st.get("spa", None), bins=obs.STAT_BINS, cap=float(obs.OTHER_STAT_CAP))
+        _set_oh_bin(fv, obs.F_STAT_SPD_BIN0, st.get("spd", None), bins=obs.STAT_BINS, cap=float(obs.OTHER_STAT_CAP))
+        _set_oh_bin(fv, obs.F_STAT_SPE_BIN0, st.get("spe", None), bins=obs.STAT_BINS, cap=float(obs.OTHER_STAT_CAP))
+
 
     ba, bd, bs, bp, be, bacc, beva = _boosts11(pokemon)
     fv[obs.F_BOOST_ATK] = ba

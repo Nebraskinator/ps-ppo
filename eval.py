@@ -70,6 +70,38 @@ class LoadedPolicy:
 
         torch.set_grad_enabled(False)
         return LoadedPolicy(cfg=cfg, device=str(dev), net=net)
+    
+    def legal_action_mask_and_map(self, battle):
+        mask = np.zeros((self.act_dim,), dtype=np.float32)
+        idx_to_action: Dict[int, tuple] = {}
+    
+        moves = list(battle.available_moves)
+        switches = list(battle.available_switches)
+    
+        can_tera = bool(getattr(battle, "can_tera", False))
+    
+        # ---- Moves ----
+        for i in range(4):
+            if i < len(moves):
+                # normal move
+                mask[i] = 1.0
+                idx_to_action[i] = ("move", i, False)
+    
+                # tera move
+                tera_idx = 4 + i
+                if can_tera and tera_idx < self.act_dim:
+                    mask[tera_idx] = 1.0
+                    idx_to_action[tera_idx] = ("move", i, True)
+    
+        # ---- Switches ----
+        base = 8
+        for j in range(6):
+            a = base + j
+            if a < self.act_dim and j < len(switches):
+                mask[a] = 1.0
+                idx_to_action[a] = ("switch", j)
+    
+        return mask, idx_to_action
 
     @torch.no_grad()
     def act_from_battle(self, battle) -> Tuple[int, float, float, np.ndarray]:
@@ -80,23 +112,12 @@ class LoadedPolicy:
 
         tb = build_tokens(battle, obs)  # must match training schema; padded to t_max already
 
-        # action mask (same mapping as training)
-        amask = np.zeros((self.cfg.env.act_dim,), dtype=np.float32)
-        moves = list(battle.available_moves)[:4]
-        switches = list(battle.available_switches)[:6]
-        for i, _mv in enumerate(moves):
-            if i >= self.cfg.env.act_dim:
-                break
-            amask[i] = 1.0
-        for j, _sw in enumerate(switches):
-            a = 4 + j
-            if a >= self.cfg.env.act_dim:
-                break
-            amask[a] = 1.0
+        amask, idx_to_action, moves, switches = self.legal_action_mask_and_map(battle)
 
-        # safety: if showdown gives a weird state
-        if amask.sum() <= 0:
+        # safety: ensure at least one legal action
+        if float(amask.sum()) <= 0.0:
             amask[0] = 1.0
+            idx_to_action[0] = ("move", 0, False)
 
         # add batch dim = 1
         ff   = torch.from_numpy(tb.float_feats[None, ...]).to(self.device, dtype=torch.float32)
@@ -114,7 +135,7 @@ class LoadedPolicy:
         a_idx = int(a_t.item())
         logp = float(logp_t.item())
         v = float(value.item())
-        return a_idx, logp, v, amask
+        return a_idx, logp, v, amask, idx_to_action, moves, switches
 
 
 class EvalPlayer(Player):
@@ -141,41 +162,13 @@ class EvalPlayer(Player):
         self._fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
         self._fh.flush()
 
-    def _legal_action_map(self, battle) -> Tuple[np.ndarray, Dict[int, Any], list, list]:
-        """
-        Mirrors training mapping:
-          0..3  = moves (up to 4)
-          4..9  = switches (up to 6)   (or up to cfg.env.act_dim)
-        """
-        act_dim = int(self.policy.cfg.env.act_dim)
-        mask = np.zeros((act_dim,), dtype=np.float32)
-        idx_to_action: Dict[int, Any] = {}
 
-        moves = list(battle.available_moves)[:4]
-        switches = list(battle.available_switches)[:6]
-
-        for i, mv in enumerate(moves):
-            if i >= act_dim:
-                break
-            mask[i] = 1.0
-            idx_to_action[i] = mv
-
-        for j, sw in enumerate(switches):
-            a = 4 + j
-            if a >= act_dim:
-                break
-            mask[a] = 1.0
-            idx_to_action[a] = sw
-
-        return mask, idx_to_action, moves, switches
 
     async def choose_move(self, battle):
-        # build mapping so we can translate action index -> move/switch object
-        amask_np, idx_to_action, moves, switches = self._legal_action_map(battle)
 
         # act
         try:
-            a_idx, logp, value, _amask_used = self.policy.act_from_battle(battle)
+            a_idx, logp, value, amask_np, idx_to_action, moves, switches = self.policy.act_from_battle(battle)
         except Exception as e:
             self._write({
                 "type": "warn",
@@ -185,9 +178,8 @@ class EvalPlayer(Player):
             })
             return self.choose_random_move(battle)
 
-        # if policy picked something illegal under current state, fallback
-        action_obj = idx_to_action.get(int(a_idx), None)
-        if action_obj is None:
+        action = idx_to_action.get(int(a_idx), None)
+        if action is None:
             self._write({
                 "type": "warn",
                 "ts": time.time(),
@@ -214,10 +206,25 @@ class EvalPlayer(Player):
             "legal_mask": amask_np.tolist(),
             "available_moves": [_name(m) for m in moves],
             "available_switches": [_name(s) for s in switches],
-            "chosen": _name(action_obj),
+            "chosen_tuple": action,
         })
 
-        return self.create_order(action_obj)
+        kind = action[0]
+
+        if kind == "move":
+            _, move_slot, use_tera = action
+            if move_slot >= len(moves):
+                return self.choose_random_move(battle)
+            return self.create_order(moves[move_slot], terastallize=bool(use_tera))
+    
+        if kind == "switch":
+            _, switch_slot = action
+            if switch_slot >= len(switches):
+                return self.choose_random_move(battle)
+            return self.create_order(switches[switch_slot])
+    
+        # unknown
+        return self.choose_random_move(battle)
 
     def _battle_finished_callback(self, battle):
         won = bool(getattr(battle, "won", False))

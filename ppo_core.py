@@ -126,6 +126,9 @@ class ActorCriticTransformer(nn.Module):
         self.pos_emb    = nn.Embedding(n_pos, model_dim)
         self.subpos_emb = nn.Embedding(n_subpos, model_dim)
         self.entity_emb = nn.Embedding(n_entity, model_dim)
+        
+        self.cls_emb = nn.Parameter(torch.zeros(model_dim))  # learnable CLS bias
+        nn.init.normal_(self.cls_emb, mean=0.0, std=0.02)    # optional but recommended
 
         self.in_ln = nn.LayerNorm(model_dim)
 
@@ -153,7 +156,6 @@ class ActorCriticTransformer(nn.Module):
 
         # make embedding(0) be ~neutral for "NONE"/padding IDs
         nn.init.zeros_(self.entity_emb.weight.data[0])
-        nn.init.zeros_(self.type_emb.weight.data[0])  # TT_CLS is 0 in your vocab, fine either way
         nn.init.zeros_(self.owner_emb.weight.data[2]) # OWNER_NONE=2 (optional)
         nn.init.zeros_(self.pos_emb.weight.data[-1])  # POS_NA
         nn.init.zeros_(self.subpos_emb.weight.data[-1])  # SUBPOS_NA
@@ -178,6 +180,9 @@ class ActorCriticTransformer(nn.Module):
             + self.pos_emb(pos) \
             + self.subpos_emb(subpos) \
             + self.entity_emb(entity_id)
+            
+        # Set learned CLS embedding to token 0
+        x[:, 0, :] = self.cls_emb
 
         x = self.in_ln(x)
 
@@ -513,6 +518,7 @@ def ppo_update(
     clip_vloss: bool,
     max_grad_norm: float,
     target_kl: float | None,
+    scheduler=None,
 ) -> PPOUpdateStats:
     """
     PPO update on a flat dataset.
@@ -570,6 +576,8 @@ def ppo_update(
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), max_grad_norm)
             opt.step()
+            if scheduler is not None:
+                scheduler.step()
 
             with torch.no_grad():
                 approx_kl = (mb_logp_old - logp).mean()

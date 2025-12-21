@@ -16,7 +16,7 @@ class ObsConfig:
     # Token length / float schema
     # -------------------------
     t_max: int = 128
-    float_dim: int = 112
+    float_dim: int = 324
 
     # ---- Core flags
     F_PRESENT: int = 0
@@ -65,6 +65,34 @@ class ObsConfig:
     F_MOVE_TYPE_UNKNOWN: int = 99
     F_CAN_TERA: int = 100
     F_IS_TERA: int = 101
+    
+    # binning hyperparams
+    LEVEL_BINS: int = 20
+    STAT_BINS: int = 16
+
+    # caps for computed stats (after level scaling, etc.)
+    # HP can exceed 255 in your dump (e.g., 367), so pick a cap > 255.
+    HP_STAT_CAP: float = 512.0
+    OTHER_STAT_CAP: float = 512.0
+    
+    # --- Level bins
+    F_LEVEL_BIN0: int = 112        # 20 dims: 112..131
+    
+    # --- Base stats bins (6 stats * 16 bins = 96 dims)
+    F_BASE_HP_BIN0: int = 132      # 16 dims
+    F_BASE_ATK_BIN0: int = 148
+    F_BASE_DEF_BIN0: int = 164
+    F_BASE_SPA_BIN0: int = 180
+    F_BASE_SPD_BIN0: int = 196
+    F_BASE_SPE_BIN0: int = 212
+    
+    # --- Observed computed stats bins (6 stats * 16 bins = 96 dims)
+    F_STAT_HP_BIN0: int = 228
+    F_STAT_ATK_BIN0: int = 244
+    F_STAT_DEF_BIN0: int = 260
+    F_STAT_SPA_BIN0: int = 276
+    F_STAT_SPD_BIN0: int = 292
+    F_STAT_SPE_BIN0: int = 308
 
     # 100..111 reserved for future use (12 dims of slack)
 
@@ -220,9 +248,9 @@ class ObsConfig:
 # -------------------------
 @dataclass(frozen=True)
 class ModelConfig:
-    model_dim: int = 64
+    model_dim: int = 256
     n_layers: int = 4
-    n_heads: int = 1
+    n_heads: int = 8
     ff_mult: int = 4
     dropout: float = 0.0
 
@@ -299,8 +327,9 @@ class LearnerConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     lr: float = 3e-4
+    lr_warmup_steps: int = 1000
     update_epochs: int = 4
-    minibatch_size: int = 4096
+    minibatch_size: int = 1024
     clip_coef: float = 0.2
     ent_coef: float = 0.01
     vf_coef: float = 0.5

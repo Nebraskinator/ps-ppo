@@ -30,6 +30,7 @@ class LearnerActor:
 
         self.net: Optional[ActorCriticTransformer] = None
         self.opt: Optional[optim.Optimizer] = None
+        self.sched: Optional[optim.lr_scheduler._LRScheduler] = None
 
         # dataset stores on CPU; training copies to cfg.device per update (same as you do now)
         self.dataset = AsyncEpisodeDataset(act_dim=self.run_cfg.env.act_dim, device="cpu")
@@ -53,7 +54,20 @@ class LearnerActor:
         if self.net is not None:
             return
         self.net = self.run_cfg.make_model().to(self.cfg.device).train()
-        self.opt = optim.Adam(self.net.parameters(), lr=self.cfg.lr, eps=1e-5)
+        self.opt = optim.Adam(self.net.parameters(), 
+                              lr=self.cfg.lr, 
+                              eps=1e-5,
+                              weight_decay=0.01,
+                              )
+        
+        warmup_steps = int(getattr(self.cfg, "lr_warmup_steps", 1000))  # or hardcode 1000
+        if warmup_steps > 0:
+            def lr_lambda(step: int) -> float:
+                # linear warmup to 1.0 multiplier
+                return min(1.0, float(step + 1) / float(warmup_steps))
+            self.sched = optim.lr_scheduler.LambdaLR(self.opt, lr_lambda=lr_lambda)
+        else:
+            self.sched = None
         
     def _on_loop_done(self, task: asyncio.Task):
         try:
@@ -120,6 +134,7 @@ class LearnerActor:
 
             "model": self.net.state_dict(),
             "optimizer": self.opt.state_dict(),
+            "scheduler": (None if self.sched is None else self.sched.state_dict()),
 
             "torch_rng": torch.get_rng_state(),
             "numpy_rng": np.random.get_state(),
@@ -141,6 +156,9 @@ class LearnerActor:
         assert self.net is not None and self.opt is not None
         self.net.load_state_dict(ckpt["model"])
         self.opt.load_state_dict(ckpt["optimizer"])
+        if self.sched is not None and "scheduler" in ckpt and ckpt["scheduler"] is not None:
+            self.sched.load_state_dict(ckpt["scheduler"])
+
 
         self.update_idx = int(ckpt.get("update_idx", 0))
         self.total_episodes = int(ckpt.get("total_episodes", 0))
@@ -286,6 +304,7 @@ class LearnerActor:
                     net=self.net,
                     opt=self.opt,
                     dataset=train_ds,
+                    scheduler=self.sched,
                     **self.cfg.ppo_kwargs(),
                 )
     
