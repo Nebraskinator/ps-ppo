@@ -182,7 +182,7 @@ class ActorCriticTransformer(nn.Module):
             + self.entity_emb(entity_id)
             
         # Set learned CLS embedding to token 0
-        x[:, 0, :] = self.cls_emb
+        x[:, 0, :] = x[:, 0, :] + self.cls_emb
 
         x = self.in_ln(x)
 

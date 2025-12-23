@@ -326,15 +326,21 @@ class LearnerConfig:
     # PPO
     gamma: float = 0.99
     gae_lambda: float = 0.95
+    
     lr: float = 3e-4
-    lr_warmup_steps: int = 1000
+    lr_warmup_steps: int = 60_000 # optimizer steps
+    lr_backbone_mult: float = 0.5
+    lr_pi_mult: float = 1.0
+    lr_v_mult: float = 1.0
+    weight_decay: float = 1e-4
+    
     update_epochs: int = 4
-    minibatch_size: int = 1024
+    minibatch_size: int = 512
     clip_coef: float = 0.2
     ent_coef: float = 0.01
-    vf_coef: float = 0.5
-    clip_vloss: bool = True
-    max_grad_norm: float = 0.5
+    vf_coef: float = 1.0
+    clip_vloss: bool = False
+    max_grad_norm: float = 1.0
     target_kl: Optional[float] = 0.02
 
     # update trigger
@@ -358,7 +364,17 @@ class LearnerConfig:
             target_kl=self.target_kl,
         )
 
+@dataclass(frozen=True)
+class RewardConfig:
+    # terminal result reward 
+    terminal_win: float = 1.0
+    terminal_loss: float = -1.0
 
+    # ---- optional faint shaping ----
+    use_faint_reward: bool = True
+    faint_self: float = -0.1     # penalty when one of *your* mons faints
+    faint_opp: float = +0.1      # bonus when an *opponent* mon faints
+    
 # -------------------------
 # Top-level run config
 # -------------------------
@@ -370,6 +386,7 @@ class RunConfig:
     rollout: RolloutConfig
     infer: InferenceConfig
     learner: LearnerConfig
+    reward: RewardConfig
 
     @staticmethod
     def default() -> "RunConfig":
@@ -380,6 +397,7 @@ class RunConfig:
             rollout=RolloutConfig(),
             infer=InferenceConfig(),
             learner=LearnerConfig(),
+            reward=RewardConfig(),
         )
 
     # ----- factories / adapters -----

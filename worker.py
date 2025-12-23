@@ -437,10 +437,31 @@ class RayBatchedPlayer(Player):
             
             terminal = 0.0
             if won is True:
-                terminal = 1.0
+                terminal = float(self.cfg.reward.terminal_win)
             elif lost is True:
-                terminal = -1.0
-            rew[-1] = terminal
+                terminal = float(self.cfg.reward.terminal_loss)
+                
+            if self.cfg.reward.use_faint_reward:
+                prev_sf, prev_of = count_faints_from_float_feats(ff[0], self.obs)
+            
+                for t in range(T):
+                    sf, of = count_faints_from_float_feats(ff[t], self.obs)  # ff[t]: [N,F]
+            
+                    if prev_sf is not None:
+                        d_self = max(0, sf - prev_sf)
+                        d_opp  = max(0, of - prev_of)
+            
+                        r_t = 0.0
+                        if d_self > 0:
+                            r_t += float(d_self) * float(self.cfg.reward.faint_self)
+                        if d_opp > 0:
+                            r_t += float(d_opp) * float(self.cfg.reward.faint_opp)
+
+                        rew[t-1] += r_t
+            
+                    prev_sf, prev_of = sf, of
+                
+            rew[-1] += terminal
             
             self.learn_client.submit_episode(
                 ff, tt, own, pos, sub, eid, tmsk,
