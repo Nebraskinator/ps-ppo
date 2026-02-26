@@ -31,17 +31,19 @@ A Pokémon battle state is not effectively represented as a flattened 1D array o
 Transformers are natively designed to process sets of tokens and model relationships between them. By modeling the game state as a sequence of discrete embeddings (1 Field Token, 12 Pokémon Tokens), the Self-Attention mechanism allows the network to dynamically route tactical information. For example, the model can learn to heavily attend its Active Pokémon's "Move Token" to the opponent's Active "Type Token" to natively calculate type matchups within the latent space.
 
 ![PokeTransformer Architecture](./pokeformer.png)
-*(Schematic of the attention mechanism routing structured game state tokens)*
+*(Schematic of the subnet and transformer architecture used in this study)*
 
 ## Methodology and Results
 
 To address the sparse reward problem and bootstrap the agent's representation of foundational mechanics, training was conducted in two distinct phases:
 
 1. **Behavioral Cloning (Imitation Learning):** An initial dataset was generated using the programmatic heuristic bots provided in the `poke-env` library (specifically `SimpleHeuristicsPlayer`). The Transformer was trained via cross-entropy loss to predict the heuristic actions, establishing a baseline of legal and generally logical play.
-2. **Proximal Policy Optimization (PPO):** Following the imitation phase, the model transitioned to distributed self-play using Ray.
+2. **Proximal Policy Optimization (PPO):** Following the imitation phase, the model transitioned to distributed self-play using Ray. The agent was trained on >150M states over the course of 2 days on a consumer PC (RTX 3090).
 
 **Results:**
-The resulting agent achieved a rating of **1600 ELO on the Generation 9 Random Battle ladder.** To my knowledge, this represents the highest documented performance for a pure neural policy in Pokémon Showdown. During inference, the agent does not utilize MCTS, Expectimax, or external programmatic damage calculators. The raw observation tensor is processed, and the optimal tactical action is sampled from the output distribution in a single forward pass.
+The resulting agent achieved a rating exceeding **1600 ELO on the Generation 9 Random Battle ladder.** To my knowledge, this represents the highest documented performance for a pure neural policy in Pokémon Showdown. During inference, the agent does not utilize MCTS, Expectimax, or external programmatic damage calculators. The raw observation tensor is processed, and the optimal tactical action is sampled from the output distribution in a single forward pass. Using this approach
+
+![Agent ELO](./ppobot.png)
 
 ## Broader Implications
 
