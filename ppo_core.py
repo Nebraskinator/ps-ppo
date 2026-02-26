@@ -1,603 +1,454 @@
-# ppo_core.py
+"""
+Core Neural Network and Proximal Policy Optimization (PPO) Utilities.
+
+This module provides the PokeTransformer architecture, customized for the complex 
+structured observation spaces of Pokemon Showdown, along with high-performance 
+sampling, GAE calculation, and PPO update logic.
+"""
+
 from __future__ import annotations
+
+import logging
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
-import math
-import random
-import numpy as np
+from typing import Tuple, Dict, Optional, Iterator, Final
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
+# Setup logger for core model events
+logger = logging.getLogger(__name__)
 
 # ----------------------------
-# Masked categorical utils
+# Numerical & Distributional Utils
 # ----------------------------
+
 def masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    m = mask.to(dtype=torch.bool)
-    neg = -1e9 if logits.dtype in (torch.float32, torch.float64) else -1e4
-    return logits.masked_fill(~m, neg)
+    """
+    Applies a boolean mask to logits, setting invalid actions to a large negative value.
+    
+    Includes a safety valve to prevent NaN outputs if an entirely zero mask is provided
+    by forcing at least one valid index.
+    """
+    mask_sum = mask.sum(dim=-1)
+    if (mask_sum == 0).any():
+        bad_indices = (mask_sum == 0).nonzero(as_tuple=True)[0]
+        mask = mask.clone()
+        mask[bad_indices, 0] = 1.0
+        logger.warning(f"Zero mask detected at batch indices {bad_indices.tolist()}. Forced index 0.")
+
+    m = (mask > 0.5).to(torch.bool)
+    return logits.masked_fill(~m, -1e4)
+
+
+def twohot_targets(x: torch.Tensor, *, v_min: float, v_max: float, v_bins: int) -> torch.Tensor:
+    """
+    Encodes scalar values into a two-hot distribution over uniform bins.
+    
+    Used for distributional value prediction to reduce variance and improve 
+    learning stability in reinforcement learning.
+    """
+    x = x.clamp(v_min, v_max)
+    scale = (v_bins - 1) / (v_max - v_min)
+    f = (x - v_min) * scale
+    i0 = torch.floor(f).long()
+    i1 = torch.clamp(i0 + 1, max=v_bins - 1)
+
+    w1 = (f - i0.float())
+    w0 = 1.0 - w1
+
+    # Edge case: exactly at the maximum bin
+    w0 = torch.where(i0 == i1, torch.ones_like(w0), w0)
+    w1 = torch.where(i0 == i1, torch.zeros_like(w1), w1)
+
+    t = torch.zeros((x.shape[0], v_bins), device=x.device, dtype=torch.float32)
+    t.scatter_add_(1, i0.view(-1, 1), w0.view(-1, 1))
+    t.scatter_add_(1, i1.view(-1, 1), w1.view(-1, 1))
+    return t
+
+
+def dist_value_loss(v_logits: torch.Tensor, target_dist: torch.Tensor) -> torch.Tensor:
+    """Computes cross-entropy loss between predicted value logits and target distributions."""
+    logp = torch.log_softmax(v_logits, dim=-1)
+    return -(target_dist * logp).sum(dim=-1).mean()
 
 
 @torch.no_grad()
-def masked_sample(logits: torch.Tensor, 
-                  mask: torch.Tensor,
-                  greedy: bool = False,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    ml = masked_logits(logits, mask)
+def masked_sample(
+    logits: torch.Tensor, 
+    mask: torch.Tensor, 
+    greedy: bool = False, 
+    temp: float = 1.0,
+    top_p: float = 1.0
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Samples actions using temperature scaling and optional Nucleus (Top-P) filtering.
+    
+    Args:
+        logits: Raw action scores.
+        mask: Valid action mask.
+        greedy: If True, returns argmax.
+        temp: Temperature (>1.0 increases entropy, <1.0 decreases it).
+        top_p: Nucleus sampling threshold.
+    """
+    ml_pure = masked_logits(logits, mask)
+    dist_pure = Categorical(logits=ml_pure)
+    
+    # Scale logits for exploration
+    ml_explore = masked_logits(logits / max(temp, 1e-4), mask)
+     
     if greedy:
-        # masked argmax
-        a = torch.argmax(ml, dim=-1)
-
-        # log-prob under the policy (useful for logging)
-        logp = torch.log_softmax(ml, dim=-1).gather(
-            1, a.unsqueeze(-1)
-        ).squeeze(-1)
-
-        # entropy is not meaningful for deterministic choice
-        ent = torch.zeros_like(logp)
-
-        return a, logp, ent
-    dist = Categorical(logits=ml)
-    a = dist.sample()
-    logp = dist.log_prob(a)
-    ent = dist.entropy()
-    return a, logp, ent
+        a = torch.argmax(ml_pure, dim=-1)
+        return a, dist_pure.log_prob(a), torch.zeros_like(a)
+    
+    if 0.0 < top_p < 1.0:
+        probs = torch.softmax(ml_explore, dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        
+        # Remove tokens outside the nucleus
+        sorted_to_remove = cumulative_probs > top_p
+        sorted_to_remove[..., 1:] = sorted_to_remove[..., :-1].clone()
+        sorted_to_remove[..., 0] = False
+        
+        indices_to_remove = sorted_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_to_remove)
+        ml_explore = ml_explore.masked_fill(indices_to_remove, float('-inf'))
+    
+    dist_explore = Categorical(logits=ml_explore)
+    a = dist_explore.sample()
+    return a, dist_pure.log_prob(a), dist_pure.entropy()
 
 
 def masked_logprob_entropy(
     logits: torch.Tensor, mask: torch.Tensor, actions: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Calculates log probabilities and entropy for a specific set of actions under a mask."""
     ml = masked_logits(logits, mask)
     dist = Categorical(logits=ml)
-    logp = dist.log_prob(actions)
-    ent = dist.entropy()
-    return logp, ent
+    return dist.log_prob(actions), dist.entropy()
 
 
 # ----------------------------
-# Model
+# Transformer Architecture
 # ----------------------------
-class ActorCritic(nn.Module):
-    def __init__(self, obs_shape: Tuple[int, ...], act_dim: int, hidden: int = 512):
+
+class ObservationUnpacker(nn.Module):
+    """
+    Slices and reshapes flat observation tensors into structured components.
+    
+    Expects metadata containing 'offsets' and dynamic dimensions from the 
+    ObservationAssembler.
+    """
+    def __init__(self, meta: dict):
         super().__init__()
-        obs_dim = int(np.prod(obs_shape))
+        self.meta = meta
+        self.offsets = meta["offsets"]
+        self.dim_body = meta["dim_pokemon_body"]
+        self.dim_move_sc = meta["dim_move_scalars"] // 4
 
-        self.trunk = nn.Sequential(
-            nn.LayerNorm(obs_dim),
-            nn.Linear(obs_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-        )
-        self.pi = nn.Linear(hidden, act_dim)
-        self.v = nn.Linear(hidden, 1)
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        out = {name: x[:, start:end] for name, (start, end) in self.offsets.items()}
+        
+        # Reshape structured fields
+        out["pokemon_body"] = out["pokemon_body"].reshape(-1, 12, self.dim_body)
+        out["pokemon_ids"]  = out["pokemon_ids"].reshape(-1, 12, 2).to(torch.long)
+        out["ability_ids"]  = out["ability_ids"].reshape(-1, 12, 4).to(torch.long)
+        out["move_ids"]     = out["move_ids"].reshape(-1, 12, 4).to(torch.long)
+        out["move_scalars"] = out["move_scalars"].reshape(-1, 12, 4, self.dim_move_sc)
+        out["transition_move_ids"] = out["transition_move_ids"].reshape(-1, 2).to(torch.long)
+        out["transition_scalars"]  = out["transition_scalars"].reshape(-1, 10)
+        
+        return out
 
-        # Orthogonal init (robust PPO default)
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
-                nn.init.constant_(m.bias, 0.0)
-        nn.init.orthogonal_(self.pi.weight, gain=0.01)
-        nn.init.orthogonal_(self.v.weight, gain=1.0)
-
-    def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = obs.flatten(1)
-        h = self.trunk(x)
-        logits = self.pi(h)
-        value = self.v(h).squeeze(-1)
-        return logits, value
-
-class ActorCriticTransformer(nn.Module):
+class PokeTransformer(nn.Module):
+    """
+    Advanced Transformer-based policy and value network for Pokémon Showdown.
+    
+    This model uses a "Decision-Token" architecture where Actor and Critic tokens
+    attend to a pool of Field and Pokémon state tokens.
+    """
     def __init__(
         self,
         act_dim: int,
-        *,
-        model_dim: int = 128,
+        meta: dict,
+        emb_dims: Dict[str, int],
+        out_dims: Dict[str, int],
+        bank_dims: Dict[str, int],
+        bank_ranges: Dict[str, int],
+        n_heads: int = 8,
         n_layers: int = 4,
-        n_heads: int = 4,
-        ff_mult: int = 4,
-        dropout: float = 0.0,
-        # ---- obs schema ----
-        t_max: int = 128,
-        float_dim: int = 16,
-        n_tok_types: int = 8,
-        n_owner: int = 3,
-        n_pos: int = 7,       # 0..5 plus POS_NA=6
-        n_subpos: int = 5,    # 0..3 plus SUBPOS_NA=4
-        n_entity: int = 1,    # set to showdown_obs.N_ENTITY
+        ff_expansion: float = 2.0,
+        v_bins: int = 51,
+        dropout: float = 0.0
     ):
         super().__init__()
-        self.act_dim = act_dim
-        self.t_max = t_max
-        self.float_dim = float_dim
-
-        # floats -> model_dim
-        self.float_proj = nn.Sequential(
-            nn.LayerNorm(float_dim),
-            nn.Linear(float_dim, model_dim),
-            nn.GELU(),
-            nn.Linear(model_dim, model_dim),
-        )
-
-        # categorical embeddings (all summed)
-        self.type_emb   = nn.Embedding(n_tok_types, model_dim)
-        self.owner_emb  = nn.Embedding(n_owner, model_dim)
-        self.pos_emb    = nn.Embedding(n_pos, model_dim)
-        self.subpos_emb = nn.Embedding(n_subpos, model_dim)
-        self.entity_emb = nn.Embedding(n_entity, model_dim)
+        self.meta = meta
+        self.f_map = meta["feature_map"]
+        self.d_model = out_dims["pokemon_vec"]
+        self.n_pok = meta["n_pokemon_slots"]
         
-        self.cls_emb = nn.Parameter(torch.zeros(model_dim))  # learnable CLS bias
-        nn.init.normal_(self.cls_emb, mean=0.0, std=0.02)    # optional but recommended
+        # 1. Identity Embeddings
+        self.pokemon_id_emb = nn.Embedding(meta["vocab_pokemon"], emb_dims["pokemon"])
+        self.item_emb       = nn.Embedding(meta["vocab_item"], emb_dims["item"])
+        self.ability_emb    = nn.Embedding(meta["vocab_ability"], emb_dims["ability"])
+        self.move_emb       = nn.Embedding(meta["vocab_move"], emb_dims["move"])
+        
+        self.val_100_emb = nn.Embedding(bank_ranges["val_100"], bank_dims["val_100"])
+        self.stat_emb    = nn.Embedding(bank_ranges["stat"], bank_dims["stat"])
+        self.power_emb   = nn.Embedding(bank_ranges["power"], bank_dims["power"])
+        
+        # 2. Subnet Configuration
+        self.move_net = self._build_subnet(self._calc_move_in(emb_dims, bank_dims), out_dims["move_vec"], ff_expansion)
+        self.ability_net = self._build_subnet(emb_dims["ability"] * meta["n_ability_slots"], out_dims["ability_vec"], ff_expansion)
+        
+        pok_in_dim = self._calc_pok_in(emb_dims, bank_dims, out_dims)
+        self.pokemon_net = self._build_subnet(pok_in_dim, self.d_model, ff_expansion)
 
-        self.in_ln = nn.LayerNorm(model_dim)
+        field_in_dim = bank_dims["val_100"] + (meta["dim_global_scalars"] - 1) + (emb_dims["move"] * 2) + meta["dim_transition_scalars"]
+        self.field_net = self._build_subnet(field_in_dim, self.d_model, ff_expansion)
 
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=model_dim,
-            nhead=n_heads,
-            dim_feedforward=model_dim * ff_mult,
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
-            norm_first=True,
+        # 3. Transformer Block
+        self.actor_tok = nn.Parameter(torch.randn(1, 1, self.d_model))
+        self.critic_tok = nn.Parameter(torch.randn(1, 1, self.d_model))
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model, nhead=n_heads, dim_feedforward=int(self.d_model * ff_expansion),
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-        self.pi = nn.Linear(model_dim, act_dim)
-        self.v  = nn.Linear(model_dim, 1)
+        # 4. Attention and Masking
+        self.total_tokens = 2 + 1 + self.n_pok 
+        self.register_buffer("attn_mask", self._build_poke_mask())
+        
+        # Cross-Attention Readout
+        self.readout_mha = nn.MultiheadAttention(self.d_model, n_heads, dropout=dropout, batch_first=True)
+        self.readout_norm_attn = nn.LayerNorm(self.d_model)
+        self.readout_norm_ff = nn.LayerNorm(self.d_model)
+        self.readout_net = nn.Sequential(
+            nn.Linear(self.d_model, int(self.d_model * ff_expansion)),
+            nn.GELU(),
+            nn.Linear(int(self.d_model * ff_expansion), self.d_model)
+        )
 
-        # init (same style you used)
+        # 5. Output Heads
+        self.pi_head = nn.Linear(self.d_model, act_dim)
+        self.v_head = nn.Linear(self.d_model, v_bins)
+        self.unpacker = ObservationUnpacker(meta)
+        self.register_buffer("v_support", torch.linspace(-1.6, 1.6, v_bins))
+        
+        self._reset_parameters()
+
+    def _calc_move_in(self, emb, bank):
+        m = self.f_map["move"]
+        return emb["move"] + (bank["val_100"] * 2) + bank["power"] + (m["type_raw"][1] - m["onehots_raw"][0])
+
+    def _calc_pok_in(self, emb, bank, out):
+        b = self.f_map["body"]
+        raw_body_slice_len = (b["boosts_raw"][1] - b["boosts_raw"][0]) + (self.meta["dim_pokemon_body"] - b["flags_raw"][0])
+        return (emb["pokemon"] + emb["item"] + bank["val_100"] * 2 + bank["stat"] * 8 + 
+                out["ability_vec"] + (self.meta["n_move_slots"] * out["move_vec"]) + raw_body_slice_len)
+
+    def _build_subnet(self, in_d, out_d, ff_expansion):
+        return nn.Sequential(
+            nn.Linear(in_d, int(out_d * ff_expansion)), nn.GELU(),
+            nn.Linear(int(out_d * ff_expansion), out_d), nn.LayerNorm(out_d)
+        )
+
+    def _build_poke_mask(self) -> torch.Tensor:
+        """Creates an attention mask: State tokens cannot see Decision tokens."""
+        mask = torch.zeros(self.total_tokens, self.total_tokens)
+        mask[2:, 0:2] = float('-inf')  # State cannot attend to Actor/Critic
+        mask[0, 1] = float('-inf')     # Actor cannot see Critic
+        mask[1, 0] = float('-inf')     # Critic cannot see Actor
+        return mask
+
+    def _reset_parameters(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
-                nn.init.constant_(m.bias, 0.0)
-        nn.init.orthogonal_(self.pi.weight, gain=0.01)
-        nn.init.orthogonal_(self.v.weight, gain=1.0)
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, std=0.02)
+        nn.init.normal_(self.actor_tok, std=0.02)
+        nn.init.normal_(self.critic_tok, std=0.02)
 
-        # make embedding(0) be ~neutral for "NONE"/padding IDs
-        nn.init.zeros_(self.entity_emb.weight.data[0])
-        nn.init.zeros_(self.owner_emb.weight.data[2]) # OWNER_NONE=2 (optional)
-        nn.init.zeros_(self.pos_emb.weight.data[-1])  # POS_NA
-        nn.init.zeros_(self.subpos_emb.weight.data[-1])  # SUBPOS_NA
+    def forward(self, obs_flat: torch.Tensor, **kwargs):
+        """Standard forward pass returning (action_logits, value_logits, expected_value)."""
+        obs = self.unpacker(obs_flat.float())
+        b_map, m_map, g_map = self.f_map["body"], self.f_map["move"], self.f_map["global"]
+        B = obs_flat.shape[0]
 
-    def forward(
-        self,
-        float_feats: torch.Tensor,   # [B, T, F]
-        tok_type: torch.Tensor,      # [B, T]
-        owner: torch.Tensor,         # [B, T]
-        pos: torch.Tensor,           # [B, T]
-        subpos: torch.Tensor,        # [B, T]
-        entity_id: torch.Tensor,     # [B, T]
-        token_mask: Optional[torch.Tensor] = None,  # [B, T] 1=keep,0=pad
-    ):
-        # floats
-        x = self.float_proj(float_feats)
+        # 1. Feature Extraction (Moves -> Abilities -> Pokemon)
+        m_sc = obs["move_scalars"]
+        m_combined = torch.cat([
+            self.move_emb(obs["move_ids"]),
+            self.val_100_emb(m_sc[..., m_map["acc_int"]].long()),
+            self.power_emb(m_sc[..., m_map["pwr_int"]].long()),
+            self.val_100_emb(m_sc[..., m_map["pp_int"]].long()),
+            m_sc[..., m_map["onehots_raw"][0] : m_map["type_raw"][1]]
+        ], dim=-1)
+        m_vecs = self.move_net(m_combined.view(B * self.n_pok * 4, -1)).view(B, self.n_pok, -1)
+        a_vecs = self.ability_net(self.ability_emb(obs["ability_ids"]).view(B, self.n_pok, -1))
 
-        # categorical sums
-        x = x \
-            + self.type_emb(tok_type) \
-            + self.owner_emb(owner) \
-            + self.pos_emb(pos) \
-            + self.subpos_emb(subpos) \
-            + self.entity_emb(entity_id)
-            
-        # Set learned CLS embedding to token 0
-        x[:, 0, :] = x[:, 0, :] + self.cls_emb
+        p_body = obs["pokemon_body"]
+        s_idx, m_idx = b_map["stats_int"], b_map["weight_int"]
+        p_in = torch.cat([
+            self.pokemon_id_emb(obs["pokemon_ids"][:, :, 0]),
+            self.item_emb(obs["pokemon_ids"][:, :, 1]),
+            self.val_100_emb(p_body[:, :, b_map["hp_int"]].long()),
+            self.stat_emb(p_body[:, :, s_idx[0] : s_idx[1]].long()).flatten(2),
+            self.val_100_emb(p_body[:, :, b_map["level_int"]].long()),
+            self.stat_emb(p_body[:, :, m_idx : m_idx+2].long()).flatten(2),
+            a_vecs, m_vecs,
+            p_body[:, :, b_map["boosts_raw"][0] : b_map["boosts_raw"][1]],
+            p_body[:, :, b_map["flags_raw"][0] : ]
+        ], dim=-1)
+        p_tokens = self.pokemon_net(p_in.view(B * self.n_pok, -1)).view(B, self.n_pok, -1)
 
-        x = self.in_ln(x)
+        # 2. Field & Sequence
+        turn_emb = self.val_100_emb(torch.clamp(obs["global_scalars"][:, g_map["turn_int"]] * 100, 0, 100).long())
+        field_in = torch.cat([
+            turn_emb, obs["global_scalars"][:, g_map["remainder_raw"][0] : ],
+            self.move_emb(obs["transition_move_ids"]).view(B, -1), obs["transition_scalars"]
+        ], dim=-1)
+        field_token = self.field_net(field_in).unsqueeze(1)
 
-        key_padding_mask = None
-        if token_mask is not None:
-            key_padding_mask = (token_mask <= 0.5)  # True = PAD
+        full_seq = torch.cat([self.actor_tok.expand(B, -1, -1), self.critic_tok.expand(B, -1, -1), field_token, p_tokens], dim=1)
+        transformed = self.transformer(full_seq, mask=self.attn_mask)
+        
+        # 3. Readout (MHA over full sequence context)
+        q = self.readout_norm_attn(transformed[:, 0:2, :])
+        kv = self.readout_norm_attn(transformed)
+        attended, _ = self.readout_mha(query=q, key=kv, value=kv, attn_mask=self.attn_mask[0:2, :])
+        q_out = transformed[:, 0:2, :] + attended
+        q_out = q_out + self.readout_net(self.readout_norm_ff(q_out))
 
-        h = self.encoder(x, src_key_padding_mask=key_padding_mask)
-
-        cls = h[:, 0, :]  # CLS index 0 by construction
-        logits = self.pi(cls)
-        value  = self.v(cls).squeeze(-1)
-        return logits, value
-
-
-# ----------------------------
-# PPO config
-# ----------------------------
-@dataclass
-class PPOConfig:
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    seed: int = 0
-
-    num_envs: int = 64
-    rollout_steps: int = 256  # sparse rewards -> longer rollouts help
-
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-
-    lr: float = 3e-4
-    lr_anneal: bool = True
-    max_grad_norm: float = 0.5
-
-    update_epochs: int = 4
-    minibatch_size: int = 4096  # tune based on CPU/GPU
-    clip_coef: float = 0.2
-    ent_coef: float = 0.01
-    vf_coef: float = 0.5
-    clip_vloss: bool = True
-    target_kl: Optional[float] = 0.02
-
-    # --- league self-play ---
-    league_capacity: int = 16
-    league_add_every: int = 25          # add a snapshot every N updates
-    league_p_latest: float = 0.50       # prob opponent is the latest learner
-    league_p_random: float = 0.00       # optional: pure random opponent fallback
-    
-    # --- battle logging ---
-    log_dir: str = "battle_logs"
-    log_every: int = 1          # log one battle every N updates
-    watched_env_index: int = 0   # which env to log
-    
-    ckpt_dir: str = "checkpoints"
-    save_every: int = 25        # save every N updates
-    keep_last: int = 5          # rolling window
-    save_latest: bool = True 
-    
-    resume_path: str | None = None
-
+        # 4. Heads
+        v_logits = self.v_head(q_out[:, 1, :])
+        v_exp = (torch.softmax(v_logits, dim=-1) * self.v_support).sum(dim=-1)
+        return self.pi_head(q_out[:, 0, :]), v_logits, v_exp
 
 # ----------------------------
-# Rollout buffer for learner only (player_0)
+# Training Components
 # ----------------------------
-class LearnerRollout:
-    def __init__(self, T: int, E: int, obs_shape: Tuple[int, ...], act_dim: int, device: str):
-        self.T, self.E = T, E
-        self.device = device
-
-        self.obs = torch.zeros((T, E, *obs_shape), device=device)
-        self.mask = torch.zeros((T, E, act_dim), device=device)
-
-        self.act = torch.zeros((T, E), dtype=torch.long, device=device)
-        self.logp = torch.zeros((T, E), device=device)
-        self.val = torch.zeros((T, E), device=device)
-
-        self.rew = torch.zeros((T, E), device=device)
-        self.done = torch.zeros((T, E), device=device)   # learner done
-        self.live = torch.zeros((T, E), device=device)   # learner acting (should be 1 until dead)
-
-        self.adv = torch.zeros((T, E), device=device)
-        self.ret = torch.zeros((T, E), device=device)
-
-        self.t = 0
-
-    def add(self, obs, mask, act, logp, val, rew, done, live):
-        t = self.t
-        self.obs[t].copy_(obs)
-        self.mask[t].copy_(mask)
-        self.act[t].copy_(act)
-        self.logp[t].copy_(logp)
-        self.val[t].copy_(val)
-        self.rew[t].copy_(rew)
-        self.done[t].copy_(done)
-        self.live[t].copy_(live)
-        self.t += 1
-
-    @torch.no_grad()
-    def compute_gae(self, last_val: torch.Tensor, gamma: float, lam: float):
-        """
-        last_val: [E]
-        """
-        gae = torch.zeros((self.E,), device=self.device)
-        for t in reversed(range(self.T)):
-            next_nonterminal = 1.0 - self.done[t]
-            next_value = last_val if t == self.T - 1 else self.val[t + 1]
-            delta = self.rew[t] + gamma * next_value * next_nonterminal - self.val[t]
-            gae = delta + gamma * lam * next_nonterminal * gae
-            self.adv[t] = gae
-        self.ret = self.adv + self.val
-
-    def iter_minibatches(self, mb_size: int):
-        obs = self.obs.reshape((-1, *self.obs.shape[2:]))
-        mask = self.mask.reshape((-1, self.mask.shape[-1]))
-        act = self.act.reshape((-1,))
-        logp = self.logp.reshape((-1,))
-        val = self.val.reshape((-1,))
-        adv = self.adv.reshape((-1,))
-        ret = self.ret.reshape((-1,))
-        live = self.live.reshape((-1,))
-
-        idx = torch.nonzero(live > 0.5, as_tuple=False).squeeze(-1)
-        idx = idx[torch.randperm(idx.numel(), device=idx.device)]
-        for start in range(0, idx.numel(), mb_size):
-            mb = idx[start:start + mb_size]
-            yield obs[mb], mask[mb], act[mb], logp[mb], val[mb], adv[mb], ret[mb]
-
-
-# ----------------------------
-# League manager (frozen opponent snapshots)
-# ----------------------------
-class League:
-    def __init__(self, obs_shape: Tuple[int, ...], act_dim: int, device: str, capacity: int):
-        self.obs_shape = obs_shape
-        self.act_dim = act_dim
-        self.device = device
-        self.capacity = capacity
-        self.snapshots: List[ActorCritic] = []
-
-    @torch.no_grad()
-    def add_snapshot(self, net: ActorCritic):
-        snap = ActorCritic(self.obs_shape, self.act_dim).to(self.device)
-        snap.load_state_dict({k: v.detach().clone() for k, v in net.state_dict().items()})
-        snap.eval()
-        for p in snap.parameters():
-            p.requires_grad_(False)
-
-        self.snapshots.append(snap)
-        if len(self.snapshots) > self.capacity:
-            # drop oldest
-            self.snapshots.pop(0)
-
-    def sample_opponent(self, latest_net: ActorCritic, p_latest: float, p_random: float = 0.0):
-        r = random.random()
-        if r < p_random:
-            return None  # special-cased random opponent
-        if r < p_random + p_latest or len(self.snapshots) == 0:
-            return latest_net
-        return random.choice(self.snapshots)
-    
-    @torch.no_grad()
-    def add_snapshot_path(self, path: str):
-        """
-        Load a saved ActorCritic state_dict from disk and add as a frozen snapshot.
-        Expects `torch.save(learner.state_dict(), path)` format.
-        """
-        state = torch.load(path, map_location=self.device)
-    
-        snap = ActorCritic(self.obs_shape, self.act_dim).to(self.device)
-        snap.load_state_dict(state)
-        snap.eval()
-        for p in snap.parameters():
-            p.requires_grad_(False)
-    
-        self.snapshots.append(snap)
-        if len(self.snapshots) > self.capacity:
-            self.snapshots.pop(0)
-
-# ============================
-# Async episodic dataset for Showdown-style training
-# ============================
-from dataclasses import dataclass
 
 @dataclass
 class PPOUpdateStats:
+    """Statistics container for a single PPO update batch."""
     approx_kl: float
     clip_frac: float
     entropy: float
     v_loss: float
     pg_loss: float
+    hp_loss: float
+    total_loss: float
     n_mb: int
 
 class AsyncEpisodeDataset:
+    """
+    Buffer for storing and tensorizing transition data from asynchronous workers.
+    """
     def __init__(self, act_dim: int, device: str):
-        self.act_dim = int(act_dim)
-        self.device = device
+        self.act_dim, self.device = act_dim, device
         self.clear()
-    
-    def __len__(self):
-        return int(self.n_steps)
-    
-    def _maybe_pin(self, x: torch.Tensor) -> torch.Tensor:
-        return x.pin_memory() if x.device.type == "cpu" else x
-    
-    def swap_out_tensor_cache(self):
-        data = self.tensorize()
-        self.clear()
-        return data
-    
+
+    def __len__(self): return int(self.n_steps)
+
     def clear(self):
-        self._tensor_cache = None
-        self.float_feats = []
-        self.tok_type = []
-        self.owner = []
-        self.pos = []
-        self.subpos = []
-        self.entity_id = []
-        self.tmask  = []
-        self.amask  = []
-        self.act    = []
-        self.logp   = []
-        self.val    = []
-        self.adv    = []
-        self.ret    = []
+        self.obs, self.act, self.logp, self.val, self.adv, self.ret, self.next_hp = [], [], [], [], [], [], []
         self.n_steps = 0
-
-    def add_steps(self, float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask, act, logp, val, adv, ret):
-        # float_feats: [T, N, F]
-        # tok_type/owner/pos/subpos/entity_id: [T, N]
-        # tmask: [T, N], amask: [T, A]
-        # act/logp/val/adv/ret: [T]
-        def dev(x):
-            return x.detach().cpu() if self.device == "cpu" else x.detach().to(self.device)
-
-        self.float_feats.append(dev(float_feats))
-        self.tok_type.append(dev(tok_type))
-        self.owner.append(dev(owner))
-        self.pos.append(dev(pos))
-        self.subpos.append(dev(subpos))
-        self.entity_id.append(dev(entity_id))
-        self.tmask.append(dev(tmask))
-        self.amask.append(dev(amask))
-        self.act.append(dev(act))
-        self.logp.append(dev(logp))
-        self.val.append(dev(val))
-        self.adv.append(dev(adv))
-        self.ret.append(dev(ret))
-
-        self.n_steps += int(act.shape[0])
         self._tensor_cache = None
 
-    def tensorize(self):
-        if self._tensor_cache is not None:
-            return self._tensor_cache
+    def add_steps(self, obs_td, act, logp, val, adv, ret, next_hp):
+        def dev(x): return x.detach().to(self.device)
+        self.obs.append(obs_td.detach().to("cpu", non_blocking=True))
+        self.act.append(dev(act)); self.logp.append(dev(logp))
+        self.val.append(dev(val)); self.adv.append(dev(adv))
+        self.ret.append(dev(ret)); self.next_hp.append(dev(next_hp))
+        self.n_steps += int(act.shape[0])
 
-        float_feats = self._maybe_pin(torch.cat(self.float_feats, dim=0))
-        tok_type    = self._maybe_pin(torch.cat(self.tok_type,    dim=0))
-        owner       = self._maybe_pin(torch.cat(self.owner,       dim=0))
-        pos         = self._maybe_pin(torch.cat(self.pos,         dim=0))
-        subpos      = self._maybe_pin(torch.cat(self.subpos,      dim=0))
-        entity_id   = self._maybe_pin(torch.cat(self.entity_id,   dim=0))
-        tmask       = self._maybe_pin(torch.cat(self.tmask,       dim=0))
-    
-        amask  = self._maybe_pin(torch.cat(self.amask,  dim=0))
-        act    = self._maybe_pin(torch.cat(self.act,    dim=0))
-        logp   = self._maybe_pin(torch.cat(self.logp,   dim=0))
-        val    = self._maybe_pin(torch.cat(self.val,    dim=0))
-        adv    = self._maybe_pin(torch.cat(self.adv,    dim=0))
-        ret    = self._maybe_pin(torch.cat(self.ret,    dim=0))
-
-        self._tensor_cache = (float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask, act, logp, val, adv, ret)
+    def tensorize(self) -> Tuple:
+        if self._tensor_cache: return self._tensor_cache
+        self._tensor_cache = (
+            torch.cat(self.obs, dim=0), torch.cat(self.act, dim=0), 
+            torch.cat(self.logp, dim=0).float(), torch.cat(self.val, dim=0).float(), 
+            torch.cat(self.adv, dim=0).float(), torch.cat(self.ret, dim=0).float(), 
+            torch.cat(self.next_hp, dim=0).float()
+        )
         return self._tensor_cache
 
-    def iter_minibatches(self, mb_size: int, shuffle: bool = True):
-        float_feats, tok_type, owner, pos, subpos, entity_id, tmask, amask, act, logp, val, adv, ret = self.tensorize()
+    def iter_minibatches(self, mb_size: int) -> Iterator[Tuple]:
+        obs, act, logp, val, adv, ret, next_hp = self.tensorize()
         n = act.shape[0]
-        idx = torch.arange(n, device=act.device)
-        if shuffle:
-            idx = idx[torch.randperm(n, device=act.device)]
-        for start in range(0, n, mb_size):
-            mb = idx[start:start + mb_size]
-            yield (
-                float_feats[mb],
-                tok_type[mb],
-                owner[mb],
-                pos[mb],
-                subpos[mb],
-                entity_id[mb],
-                tmask[mb],
-                amask[mb],
-                act[mb],
-                logp[mb],
-                val[mb],
-                adv[mb],
-                ret[mb],
-            )
-
-
-
-@torch.no_grad()
-def gae_from_episode(
-    rewards: torch.Tensor,     # [T]
-    values: torch.Tensor,      # [T]
-    dones: torch.Tensor,       # [T] (1 at terminal step)
-    gamma: float,
-    lam: float,
-    last_value: float = 0.0,   # terminal -> 0
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Computes GAE for one episode.
-    """
-    T = rewards.shape[0]
-    adv = torch.zeros((T,), device=rewards.device)
-    gae = torch.tensor(0.0, device=rewards.device)
-    for t in reversed(range(T)):
-        next_nonterminal = 1.0 - dones[t]
-        next_value = torch.tensor(last_value, device=rewards.device) if (t == T - 1) else values[t + 1]
-        delta = rewards[t] + gamma * next_value * next_nonterminal - values[t]
-        gae = delta + gamma * lam * next_nonterminal * gae
-        adv[t] = gae
-    ret = adv + values
-    return adv, ret
+        idx = torch.randperm(n, device=act.device)
+        for start in range(0, (n // mb_size) * mb_size, mb_size):
+            mb = idx[start : start + mb_size]
+            yield obs[mb], act[mb], logp[mb], val[mb], adv[mb], ret[mb], next_hp[mb]
 
 def ppo_update(
     net: nn.Module,
     opt: optim.Optimizer,
     dataset: AsyncEpisodeDataset,
-    *,
-    update_epochs: int,
-    minibatch_size: int,
-    clip_coef: float,
-    ent_coef: float,
-    vf_coef: float,
-    clip_vloss: bool,
-    max_grad_norm: float,
-    target_kl: float | None,
-    scheduler=None,
+    mode: str = "ppo",
+    **cfg
 ) -> PPOUpdateStats:
     """
-    PPO update on a flat dataset.
+    Executes a PPO update across multiple epochs and minibatches.
+    
+    Includes early stopping based on Target KL to prevent policy collapse.
     """
     dev = next(net.parameters()).device
-    kl_sum = clip_sum = ent_sum = v_sum = pg_sum = 0.0
+    stats = {k: 0.0 for k in ["kl", "clip", "ent", "v", "pg", "total"]}
     n_mb = 0
-
-    for epoch in range(update_epochs):
-        for (mb_ff, mb_tt, mb_own, mb_pos, mb_sub, mb_eid, mb_tmask,
-             mb_amask, mb_act, mb_logp_old, mb_val_old, mb_adv, mb_ret) in dataset.iter_minibatches(minibatch_size):
+    
+    for epoch in range(cfg.get("update_epochs", 1)):
+        epoch_kl, epoch_mb = 0.0, 0
+        for (mb_obs, mb_act, mb_logp_old, _, mb_adv, mb_ret, _) in dataset.iter_minibatches(cfg["minibatch_size"]):
+            mb_obs, mb_act, mb_logp_old, mb_adv, mb_ret = (t.to(dev) for t in [mb_obs, mb_act, mb_logp_old, mb_adv, mb_ret])
             
-            mb_ff    = mb_ff.to(dev, non_blocking=True)
-            mb_tt    = mb_tt.to(dev, non_blocking=True)
-            mb_own   = mb_own.to(dev, non_blocking=True)
-            mb_pos   = mb_pos.to(dev, non_blocking=True)
-            mb_sub   = mb_sub.to(dev, non_blocking=True)
-            mb_eid   = mb_eid.to(dev, non_blocking=True)
-            mb_tmask = mb_tmask.to(dev, non_blocking=True)
-            mb_amask = mb_amask.to(dev, non_blocking=True)
-            mb_act   = mb_act.to(dev, non_blocking=True)
-            mb_logp_old = mb_logp_old.to(dev, non_blocking=True)
-            mb_val_old  = mb_val_old.to(dev, non_blocking=True)
-            mb_adv      = mb_adv.to(dev, non_blocking=True)
-            mb_ret      = mb_ret.to(dev, non_blocking=True)
-        
-            logits, v = net(mb_ff, mb_tt, mb_own, mb_pos, mb_sub, mb_eid, mb_tmask)
-            A = logits.shape[-1]
-            if mb_act.min().item() < 0 or mb_act.max().item() >= A:
-                print(
-                    f"[FATAL] action out of range: min={mb_act.min().item()} max={mb_act.max().item()} A={A}"
-                )
-                # Optional: dump a few bad indices
-                bad = (mb_act < 0) | (mb_act >= A)
-                bi = bad.nonzero(as_tuple=False).squeeze(-1)[:10]
-                print("bad acts:", mb_act[bi].detach().cpu().tolist())
-                raise RuntimeError("mb_act out of bounds")
-            logp, ent = masked_logprob_entropy(logits, mb_amask, mb_act)
+            m_start, m_end = net.unpacker.offsets["action_mask"]
+            mb_mask = mb_obs[:, m_start:m_end]
+            
+            logits, v_logits, _ = net(mb_obs)
 
-            ratio = (logp - mb_logp_old).exp()
-            pg1 = -mb_adv * ratio
-            pg2 = -mb_adv * torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef)
-            pg_loss = torch.max(pg1, pg2).mean()
-
-            if clip_vloss:
-                v_clipped = mb_val_old + torch.clamp(v - mb_val_old, -clip_coef, clip_coef)
-                v_loss = 0.5 * torch.max((v - mb_ret).pow(2), (v_clipped - mb_ret).pow(2)).mean()
+            if mode == "imitation":
+                loss = nn.functional.cross_entropy(logits, mb_act, label_smoothing=0.1)
+                pg_loss = loss; v_loss = ent_loss = approx_kl = clip_frac = torch.tensor(0.0, device=dev)
+            elif mode == "warmup":
+                target_dist = twohot_targets(mb_ret, v_min=cfg["v_min"], v_max=cfg["v_max"], v_bins=cfg["v_bins"])
+                loss = dist_value_loss(v_logits, target_dist)
+                v_loss = loss; pg_loss = ent_loss = approx_kl = clip_frac = torch.tensor(0.0, device=dev)
             else:
-                v_loss = 0.5 * (v - mb_ret).pow(2).mean()
-
-            ent_loss = ent.mean()
-            loss = pg_loss + vf_coef * v_loss - ent_coef * ent_loss
+                logp, ent = masked_logprob_entropy(logits, mb_mask, mb_act)
+                ratio = (logp - mb_logp_old).exp()
+                pg_loss = torch.max(-mb_adv * ratio, -mb_adv * ratio.clamp(1-cfg["clip_coef"], 1+cfg["clip_coef"])).mean()
+                
+                target_dist = twohot_targets(mb_ret, v_min=cfg["v_min"], v_max=cfg["v_max"], v_bins=cfg["v_bins"])
+                v_loss = dist_value_loss(v_logits, target_dist)
+                ent_loss = ent.mean()
+                
+                loss = pg_loss + cfg["vf_coef"] * v_loss - cfg["ent_coef"] * ent_loss
+                approx_kl = (mb_logp_old - logp).mean()
+                clip_frac = ((ratio - 1.0).abs() > cfg["clip_coef"]).float().mean()
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(net.parameters(), max_grad_norm)
+            nn.utils.clip_grad_norm_(net.parameters(), cfg["max_grad_norm"])
             opt.step()
-            if scheduler is not None:
-                scheduler.step()
 
-            with torch.no_grad():
-                approx_kl = (mb_logp_old - logp).mean()
-                clip_frac = ((ratio - 1.0).abs() > clip_coef).float().mean()
+            # Stats update
+            n_mb += 1; epoch_mb += 1
+            stats["kl"] += approx_kl.item(); epoch_kl += approx_kl.item()
+            stats["clip"] += clip_frac.item(); stats["ent"] += ent_loss.item()
+            stats["v"] += v_loss.item(); stats["pg"] += pg_loss.item(); stats["total"] += loss.item()
 
-            kl_sum   += float(approx_kl.item())
-            clip_sum += float(clip_frac.item())
-            ent_sum  += float(ent_loss.item())
-            v_sum    += float(v_loss.item())
-            pg_sum   += float(pg_loss.item())
-            n_mb     += 1
-
-        if target_kl is not None and (kl_sum / max(n_mb, 1)) > target_kl:
-            break
+            if mode == "ppo" and cfg.get("target_kl") and (epoch_kl / epoch_mb) > cfg["target_kl"] * 1.5:
+                logger.info(f"Early stop at Epoch {epoch} due to KL {epoch_kl/epoch_mb:.4f}")
+                return PPOUpdateStats(**{f"{k}_loss" if k in ["v", "pg", "hp"] else k: v/n_mb for k, v in stats.items()}, n_mb=n_mb, hp_loss=0.0)
 
     return PPOUpdateStats(
-        approx_kl=kl_sum / max(n_mb, 1),
-        clip_frac=clip_sum / max(n_mb, 1),
-        entropy=ent_sum / max(n_mb, 1),
-        v_loss=v_sum / max(n_mb, 1),
-        pg_loss=pg_sum / max(n_mb, 1),
-        n_mb=n_mb,
+        approx_kl=stats["kl"]/n_mb, clip_frac=stats["clip"]/n_mb, entropy=stats["ent"]/n_mb,
+        v_loss=stats["v"]/n_mb, pg_loss=stats["pg"]/n_mb, hp_loss=0.0, total_loss=stats["total"]/n_mb, n_mb=n_mb
     )

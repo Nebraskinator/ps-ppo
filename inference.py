@@ -1,139 +1,271 @@
-# inference.py
+"""
+Inference Server and Model Management for Distributed RL.
+
+This module provides the InferenceActor, which handles large-batch GPU forward 
+passes, and utility functions for "Geometric Snapshotting"—the process of 
+selecting past model versions to maintain a diverse league for self-play.
+"""
+
 from __future__ import annotations
+
+import glob
+import logging
+import os
+import random
+import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Final
 
 import numpy as np
+import ray
 import torch
-
-from ppo_core import ActorCriticTransformer, masked_sample
 from config import RunConfig
+from ppo_core import masked_sample
+
+# Setup logging
+logger = logging.getLogger(__name__)
+
+# Constants
+CKPT_UPDATE_PATTERN: Final[re.Pattern] = re.compile(r"learner_update_(\d+)\.pt$")
+
+# -----------------------------------------------------------------------------
+# CHECKPOINT UTILITIES
+# -----------------------------------------------------------------------------
+
+def _extract_state_dict(ckpt: dict) -> dict:
+    """
+    Surgically extracts the model state dictionary from various checkpoint formats.
+    
+    Args:
+        ckpt: A dictionary loaded via torch.load.
+        
+    Returns:
+        dict: The raw state_dict containing model parameters.
+        
+    Raises:
+        RuntimeError: If no valid state_dict structure is detected.
+    """
+    if not isinstance(ckpt, dict):
+        raise RuntimeError(f"Expected dict from checkpoint, got {type(ckpt)}")
+
+    # Check common wrapper keys used in RL frameworks
+    for k in ("model", "state_dict", "net", "policy", "actor_critic"):
+        v = ckpt.get(k)
+        if isinstance(v, dict) and any(isinstance(x, torch.Tensor) for x in v.values()):
+            return v
+    
+    # If no wrapper, check if the dict itself is the state_dict
+    if any(isinstance(x, torch.Tensor) for x in ckpt.values()):
+        return ckpt
+        
+    raise RuntimeError("Could not find a model state_dict inside the checkpoint file.")
+
+
+def _pick_geometric_ckpts(
+    ckpt_dir: str, 
+    *, 
+    n_snapshots: int, 
+    min_stride: int = 100,
+    base: float = 2.0, 
+    jitter: int = 100
+) -> List[str]:
+    """
+    Selects a historical set of checkpoints based on a geometric distribution.
+    
+    This ensures the 'league' contains a mix of very recent and very old 
+    versions of the agent, preventing policy cycling and improving robustness.
+    """
+    paths = glob.glob(os.path.join(ckpt_dir, "learner_update_*.pt"))
+    if not paths:
+        return []
+
+    # Map paths to update numbers
+    updates = []
+    for p in paths:
+        if m := CKPT_UPDATE_PATTERN.search(p):
+            updates.append((p, int(m.group(1))))
+    
+    if not updates:
+        return sorted(paths)[-n_snapshots:]
+
+    updates.sort(key=lambda x: x[1])
+    latest_path, latest_u = updates[-1]
+    
+    chosen = [latest_path]
+    used = {latest_path}
+    
+    for i in range(1, n_snapshots + 1):
+        # Calculate geometric target: current - (stride * base^i)
+        delta = int(round(min_stride * (base ** (i - 1))))
+        target = max(0, latest_u - delta)
+        
+        # Find the checkpoint closest to the target update number
+        window = [p for p, u in updates if abs(u - target) <= jitter and p not in used]
+        if window:
+            cand = random.choice(window)
+        else:
+            # Fallback to absolute nearest
+            cand = min(updates, key=lambda x: abs(x[1] - target))[0]
+        
+        chosen.append(cand)
+        used.add(cand)
+        
+    return chosen
+
 
 @dataclass
 class InferenceStats:
+    """Container for monitoring inference performance and throughput."""
     flushes: int = 0
     total_requests: int = 0
-    total_batches: int = 0
+    avg_batch_size: float = 0.0
+
+# -----------------------------------------------------------------------------
+# ACTORS
+# -----------------------------------------------------------------------------
+
+@ray.remote
+class WeightStore:
+    """
+    A centralized Ray actor that serves as the latest 'truth' for model weights.
+    Workers pull from here to synchronize their local GPU models.
+    """
+    def __init__(self):
+        self.weights: Optional[dict] = None
+        self.version: int = -1
+
+    def update(self, weights: dict, version: int):
+        self.weights = weights
+        self.version = version
+
+    def get_state(self) -> Tuple[Optional[dict], int]:
+        return self.weights, self.version
 
 
 class InferenceActor:
     """
-    GPU inference server.
-
-    IMPORTANT CHANGE:
-      - Workers batch locally.
-      - This actor exposes infer_batch(tokens_B, tmask_B, amask_B) -> (act_B, logp_B, val_B)
-      - No internal asyncio queue / background loop needed.
+    High-throughput inference server responsible for GPU kernel execution.
+    
+    Supports 'Snapshot Inference'—running multiple different model versions 
+    within the same batch by grouping observations by their assigned policy_id.
     """
-    def __init__(self, cfg: RunConfig):
-        self.cfg: RunConfig = cfg
-        self.device = str(cfg.infer.device)
-        if self.device.startswith("cuda") and not torch.cuda.is_available():
-            raise RuntimeError("InferenceActor device=cuda but CUDA not available")
-
-        self.act_dim = int(cfg.env.act_dim)
-        self.obs = cfg.obs
-
-        self.net: Optional[ActorCriticTransformer] = None
+    def __init__(self, cfg: RunConfig, weight_store: ray.actor.ActorHandle):
+        self.cfg = cfg
+        self.weight_store = weight_store
+        self.device: Final[str] = str(cfg.infer.device)
+        self.n_snapshots: Final[int] = int(getattr(cfg.router, "n_snapshots", 0))
+        
+        self.current_version = -1
+        self.current_temp = cfg.learner.temp_start
         self.stats = InferenceStats()
-        self._pending_state: Optional[dict] = None
-
-        self._init_net()
-
-    def _init_net(self):
-        if self.net is not None:
-            return
-    
-        # Build exactly the same model as the learner expects
+        
+        # Build main model and league models
         self.net = self.cfg.make_model().to(self.device).eval()
-    
-        if self._pending_state is not None:
-            self.net.load_state_dict(self._pending_state)
-            self._pending_state = None
-
-    def set_weights(self, state_dict_cpu: dict):
-        if self.net is None:
-            self._pending_state = state_dict_cpu
-            return
-        self.net.load_state_dict(state_dict_cpu, strict=True)
-
-
-    def get_stats(self) -> dict:
-        return {
-            "flushes": int(self.stats.flushes),
-            "total_requests": int(self.stats.total_requests),
-            "total_batches": int(self.stats.total_batches),
-        }
+        self.snapshot_nets = [
+            self.cfg.make_model().to(self.device).eval() 
+            for _ in range(self.n_snapshots)
+        ]
+        
+        # Initial load
+        self.resume_from_disk()
 
     @torch.no_grad()
-    def infer_batch(
-        self,
-        ff_b_np: np.ndarray,      # [B, N, F] float32
-        tt_b_np: np.ndarray,      # [B, N] int64
-        own_b_np: np.ndarray,     # [B, N] int64
-        pos_b_np: np.ndarray,     # [B, N] int64
-        sub_b_np: np.ndarray,     # [B, N] int64
-        eid_b_np: np.ndarray,     # [B, N] int64
-        tmask_b_np: np.ndarray,   # [B, N] float32
-        amask_b_np: np.ndarray,   # [B, A] float32
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def infer_batch(self, policy_ids_np: np.ndarray, obs_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
+        Executes a batch forward pass.
+        
+        Args:
+            policy_ids_np: Int array mapping each observation to a specific model version.
+            obs_np: Flattened observation matrix.
+            
         Returns:
-          act   [B] int64
-          logp  [B] float32
-          value [B] float32
+            Tuple: (actions, log_probabilities, value_estimates)
         """
-        assert ff_b_np.ndim == 3,   f"ff_b_np must be [B,N,F], got {ff_b_np.shape}"
-        assert tt_b_np.ndim == 2,   f"tt_b_np must be [B,N], got {tt_b_np.shape}"
-        assert own_b_np.ndim == 2,  f"own_b_np must be [B,N], got {own_b_np.shape}"
-        assert pos_b_np.ndim == 2,  f"pos_b_np must be [B,N], got {pos_b_np.shape}"
-        assert sub_b_np.ndim == 2,  f"sub_b_np must be [B,N], got {sub_b_np.shape}"
-        assert eid_b_np.ndim == 2,  f"eid_b_np must be [B,N], got {eid_b_np.shape}"
-        assert tmask_b_np.ndim == 2,f"tmask_b_np must be [B,N], got {tmask_b_np.shape}"
-        assert amask_b_np.ndim == 2,f"amask_b_np must be [B,A], got {amask_b_np.shape}"
-
-        B = int(ff_b_np.shape[0])
+        self._sync_weights()
         
-        N = int(ff_b_np.shape[1])
-        F = int(ff_b_np.shape[2])
-        
-        assert N == self.obs.t_max, f"Expected N=t_max={self.obs.t_max}, got N={N}"
-        assert F == self.obs.float_dim, f"Expected F=float_dim={self.obs.float_dim}, got F={F}"
-        assert int(tt_b_np.shape[1]) == N
-        assert int(own_b_np.shape[1]) == N
-        assert int(pos_b_np.shape[1]) == N
-        assert int(sub_b_np.shape[1]) == N
-        assert int(eid_b_np.shape[1]) == N
-        assert int(tmask_b_np.shape[1]) == N
-        assert int(amask_b_np.shape[1]) == self.act_dim, f"Expected A=act_dim={self.act_dim}, got {amask_b_np.shape[1]}"
-        
-        self.stats.total_requests += B
-        self.stats.total_batches += 1
+        B = policy_ids_np.shape[0]
         self.stats.flushes += 1
+        self.stats.total_requests += B
+        self.stats.avg_batch_size = (self.stats.avg_batch_size * 0.95) + (B * 0.05)
 
-        assert self.net is not None
+        # Transfer to GPU
+        p_ids = torch.from_numpy(policy_ids_np).to(self.device)
+        obs = torch.from_numpy(obs_np).to(self.device)
 
-        ff_b   = torch.from_numpy(ff_b_np).to(self.device, dtype=torch.float32, non_blocking=True)
-        tt_b   = torch.from_numpy(tt_b_np).to(self.device, dtype=torch.long,   non_blocking=True)
-        own_b  = torch.from_numpy(own_b_np).to(self.device, dtype=torch.long,  non_blocking=True)
-        pos_b  = torch.from_numpy(pos_b_np).to(self.device, dtype=torch.long,  non_blocking=True)
-        sub_b  = torch.from_numpy(sub_b_np).to(self.device, dtype=torch.long,  non_blocking=True)
-        eid_b  = torch.from_numpy(eid_b_np).to(self.device, dtype=torch.long,  non_blocking=True)
-        tmask_b= torch.from_numpy(tmask_b_np).to(self.device, dtype=torch.float32, non_blocking=True)
-        amask_b= torch.from_numpy(amask_b_np).to(self.device, dtype=torch.float32, non_blocking=True)
+        # Pre-allocate output buffers
+        act_out = torch.zeros(B, dtype=torch.long, device=self.device)
+        logp_out = torch.zeros(B, dtype=torch.float32, device=self.device)
+        val_out = torch.zeros(B, dtype=torch.float32, device=self.device)
 
-        logits, value = self.net(ff_b, tt_b, own_b, pos_b, sub_b, eid_b, tmask_b)  # [B,A], [B]
+        # Process by Policy ID (0 = Latest, 1..N = Snapshots)
+        for pid in range(self.n_snapshots + 1):
+            mask = (p_ids == pid)
+            if not mask.any():
+                continue
 
+            model = self.net if pid == 0 else self.snapshot_nets[pid-1]
+            obs_sub = obs[mask]
+            
+            logits, _, value = model(obs_sub)
+            
+            # Extract Action Mask from observations
+            m_start, m_end = model.unpacker.offsets["action_mask"]
+            mask_sub = obs_sub[:, m_start:m_end].float()
+            
+            # Sampling with safety valve for empty masks
+            act, logp, _ = masked_sample(logits, mask_sub, temp=self.current_temp)
+            
+            act_out[mask] = act
+            logp_out[mask] = logp
+            val_out[mask] = value
 
-        bad = (amask_b.sum(dim=1) <= 0.0)
-        if bad.any():
-            amask_b = amask_b.clone()
-            amask_b[bad] = 0.0
-            amask_b[bad, 0] = 1.0
+        # Force sync to ensure results are ready before returning to CPU
+        torch.cuda.synchronize()
+        
+        return (
+            act_out.cpu().numpy(),
+            logp_out.cpu().numpy(),
+            val_out.cpu().numpy()
+        )
 
-        act, logp, _ent = masked_sample(logits, amask_b)
+    def _sync_weights(self):
+        """Pulls updated weights from the WeightStore if a new version is available."""
+        # Use a lightweight version check before pulling the heavy state_dict
+        latest_v = ray.get(self.weight_store.get_state.remote())[1]
+        
+        if latest_v > self.current_version:
+            weights, version = ray.get(self.weight_store.get_state.remote())
+            if weights:
+                self.net.load_state_dict(weights, strict=True)
+                self.current_version = version
+                logger.info(f"InferenceActor synced to version {version}")
 
-        act_cpu   = act.to("cpu").numpy().astype(np.int64, copy=False)
-        logp_cpu  = logp.to("cpu").numpy().astype(np.float32, copy=False)
-        value_cpu = value.to("cpu").numpy().astype(np.float32, copy=False)
-        return act_cpu, logp_cpu, value_cpu
+    def resume_from_disk(self):
+        """Initializes the actor with weights found in the checkpoint directory."""
+        if not getattr(self.cfg.learner, "resume", False):
+            return
+
+        ckpt_dir = self.cfg.learner.ckpt_dir
+        if not os.path.exists(ckpt_dir):
+            return
+
+        # Load historical snapshots for the league
+        paths = _pick_geometric_ckpts(ckpt_dir, n_snapshots=self.n_snapshots)
+        for i, p in enumerate(paths):
+            try:
+                st = _extract_state_dict(torch.load(p, map_location="cpu"))
+                if i == 0: # The most recent one in the list
+                    self.net.load_state_dict(st)
+                else:
+                    if i-1 < self.n_snapshots:
+                        self.snapshot_nets[i-1].load_state_dict(st)
+            except Exception as e:
+                logger.error(f"Failed to load checkpoint {p}: {e}")
+
+    def get_stats(self) -> dict:
+        """Returns diagnostic metrics."""
+        return {
+            "total_requests": self.stats.total_requests,
+            "avg_batch_size": round(self.stats.avg_batch_size, 2),
+            "model_version": self.current_version
+        }

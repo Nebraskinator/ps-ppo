@@ -1,385 +1,219 @@
-# config.py
+"""
+Configuration module for PokeTransformer Reinforcement Learning.
+
+This module defines the schema and default parameters for observation processing,
+neural network architecture, environment interaction, and the PPO learner.
+"""
 
 from __future__ import annotations
-from dataclasses import dataclass, asdict, field
-from typing import Any, Dict, Optional
+
+import logging
 import torch
+import torch.nn as nn
+from dataclasses import dataclass, asdict, field
+from typing import Any, Dict, Optional, Tuple, Literal, Final
+from pathlib import Path
 
+# Setup logging for configuration errors
+logger = logging.getLogger(__name__)
 
-# -------------------------
-# Observation / token schema
-# -------------------------
+# Type Aliases
+TrainingMode = Literal["imitation", "warmup", "ppo"]
+
 
 @dataclass(frozen=True)
 class ObsConfig:
-    # -------------------------
-    # Token length / float schema
-    # -------------------------
-    t_max: int = 128
-    float_dim: int = 324
-
-    # ---- Core flags
-    F_PRESENT: int = 0
-    F_KNOWN: int = 1
-    F_FAINTED: int = 2
-
-    # ---- New: HP as 20-bin one-hot (3..22)
-    F_HP_BIN0: int = 3          # 20 dims: 3..22 inclusive
-
-    # ---- Boosts (7 dims)
-    F_BOOST_ATK: int = 23
-    F_BOOST_DEF: int = 24
-    F_BOOST_SPA: int = 25
-    F_BOOST_SPD: int = 26
-    F_BOOST_SPE: int = 27
-    F_BOOST_ACC: int = 28
-    F_BOOST_EVAS: int = 29
-
-    # ---- Move scalars
-    F_BP: int = 30
-    F_ACC: int = 31
-    F_PRIO: int = 32
-    F_PP_FRAC: int = 33
-
-    # ---- Types
-    F_POK_TYPE_MH0: int = 34          # 34..51 (18 dims)
-    F_POK_TERA_TYPE_MH0: int = 52     # 52..69 (18 dims)
-    F_MOVE_TYPE_MH0: int = 70         # 70..87 (18 dims)
-    F_MOVE_CAT_OH0: int = 88          # 88..90 (3 dims)
-
-    # ---- Combat derived
-    F_STAB: int = 91
-    F_EFF_LOG2: int = 92
-    F_EFF_UNKNOWN: int = 93
-
-    # ---- Effect details
-    F_STAGE_NORM: int = 94
-    F_TURNS_NORM: int = 95
-    F_COUNTER_NORM: int = 96
-
-    # ---- active flag
-    F_IS_ACTIVE: int = 97
-
-    # ---- Optional unknown flags (keep if you still want them)
-    F_POK_TYPE_UNKNOWN: int = 98
-    F_MOVE_TYPE_UNKNOWN: int = 99
-    F_CAN_TERA: int = 100
-    F_IS_TERA: int = 101
-    
-    # binning hyperparams
-    LEVEL_BINS: int = 20
-    STAT_BINS: int = 16
-
-    # caps for computed stats (after level scaling, etc.)
-    # HP can exceed 255 in your dump (e.g., 367), so pick a cap > 255.
-    HP_STAT_CAP: float = 512.0
-    OTHER_STAT_CAP: float = 512.0
-    
-    # --- Level bins
-    F_LEVEL_BIN0: int = 112        # 20 dims: 112..131
-    
-    # --- Base stats bins (6 stats * 16 bins = 96 dims)
-    F_BASE_HP_BIN0: int = 132      # 16 dims
-    F_BASE_ATK_BIN0: int = 148
-    F_BASE_DEF_BIN0: int = 164
-    F_BASE_SPA_BIN0: int = 180
-    F_BASE_SPD_BIN0: int = 196
-    F_BASE_SPE_BIN0: int = 212
-    
-    # --- Observed computed stats bins (6 stats * 16 bins = 96 dims)
-    F_STAT_HP_BIN0: int = 228
-    F_STAT_ATK_BIN0: int = 244
-    F_STAT_DEF_BIN0: int = 260
-    F_STAT_SPA_BIN0: int = 276
-    F_STAT_SPD_BIN0: int = 292
-    F_STAT_SPE_BIN0: int = 308
-
-    # 100..111 reserved for future use (12 dims of slack)
-
-    EFF_MAX_LAYERS: float = 3.0
-    EFF_MAX_TURNS: float = 8.0
-    EFF_MAX_COUNTER: float = 10.0
-    # -------------------------
-    # Closed-vocab entity table sizes (fixed hash/id buckets)
-    # -------------------------
-    max_species: int = 1500
-    max_moves: int = 1000
-    max_items: int = 600
-    max_abilities: int = 350
-
-    # Hashed bins for open vocab
-    h_effect: int = 120
-
-    # -------------------------
-    # Token type vocab
-    # -------------------------
-    token_type_vocab: tuple[str, ...] = (
-        "cls",
-        "pokemon",
-        "move",
-        "item",
-        "ability",
-        "battlefield",
-        "effect",
-        "side_condition",
-        "field",
-    )
-    _tt_map: Dict[str, int] = field(default_factory=dict, init=False, repr=False)
-
-    def __post_init__(self):
-        object.__setattr__(self, "_tt_map", {name: i for i, name in enumerate(self.token_type_vocab)})
-
-    # Derived: categorical vocab sizes
-    @property
-    def n_tok_types(self) -> int:
-        return len(self.token_type_vocab)
-    
-    def tt(self, name: str) -> int:
-        i = self._tt_map.get(name, None)
-        if i is None:
-            raise KeyError(f"Unknown token type name: {name!r}. Valid: {self.token_type_vocab}")
-        return int(i)
-
-    # Token type IDs (derived from order above)
-    @property
-    def TT_CLS(self) -> int: return self.tt("cls")
-    @property
-    def TT_POK(self) -> int: return self.tt("pokemon")
-    @property
-    def TT_MOVE(self) -> int: return self.tt("move")
-    @property
-    def TT_ITEM(self) -> int: return self.tt("item")
-    @property
-    def TT_ABILITY(self) -> int: return self.tt("ability")
-    @property
-    def TT_BF(self) -> int: return self.tt("battlefield")
-    @property
-    def TT_EFF(self) -> int: return self.tt("effect")
-    @property
-    def TT_SC(self) -> int: return self.tt("side_condition")
-    @property
-    def TT_FIELD(self) -> int: return self.tt("field")
-
-
-    # -------------------------
-    # Owners / positions
-    # -------------------------
-    OWNER_OPP: int = 0
-    OWNER_SELF: int = 1
-    OWNER_NONE: int = 2
-    n_owner: int = 3
-
+    """Configuration for observation parsing and tokenization schema."""
     n_slots: int = 6
-    POS_NA: int = 6           # 0..5 valid, 6 means NA
-    n_pos: int = 7            # 0..5 + POS_NA
-
     n_move_slots: int = 4
-    SUBPOS_NA: int = 4        # 0..3 valid, 4 means NA
-    n_subpos: int = 5         # 0..3 + SUBPOS_NA
-
-    # -------------------------
-    # Shared entity table layout
-    # -------------------------
-    ENTITY_NONE: int = 0
-    
-    @property
-    def SPECIES_UNK(self) -> int:
-        return self.SPECIES_OFFSET
-    
-    @property
-    def MOVES_UNK(self) -> int:
-        return self.MOVES_OFFSET
-    
-    @property
-    def ITEMS_UNK(self) -> int:
-        return self.ITEMS_OFFSET
-    
-    @property
-    def ABIL_UNK(self) -> int:
-        return self.ABIL_OFFSET
-    
-    @property
-    def EFFECT_UNK(self) -> int:
-        return self.EFFECT_OFFSET
+    hp_bins: int = 11  # Categorical bins for HP percentage
+    vocab_path: str = "vocab.json"
 
 
-    @property
-    def SPECIES_OFFSET(self) -> int:
-        return 1  # reserve 0 for ENTITY_NONE globally
-    
-    @property
-    def MOVES_OFFSET(self) -> int:
-        return self.SPECIES_OFFSET + (1 + self.max_species)
-    
-    @property
-    def ITEMS_OFFSET(self) -> int:
-        return self.MOVES_OFFSET + (1 + self.max_moves)
-    
-    @property
-    def ABIL_OFFSET(self) -> int:
-        return self.ITEMS_OFFSET + (1 + self.max_items)
-    
-    @property
-    def EFFECT_OFFSET(self) -> int:
-        return self.ABIL_OFFSET + (1 + self.max_abilities)
-    
-    @property
-    def n_entity(self) -> int:
-        # +1 for UNK, +2*h_effect for (known effects + hashed effects)
-        return self.EFFECT_OFFSET + (1 + 2 * self.h_effect)
-    
-
-
-    def model_kwargs(self) -> Dict[str, Any]:
-        return dict(
-            t_max=self.t_max,
-            float_dim=self.float_dim,
-            n_tok_types=self.n_tok_types,
-            n_owner=self.n_owner,
-            n_pos=self.n_pos,
-            n_subpos=self.n_subpos,
-            n_entity=self.n_entity,
-        )
-
-
-
-# -------------------------
-# Model config
-# -------------------------
 @dataclass(frozen=True)
 class ModelConfig:
-    model_dim: int = 256
-    n_layers: int = 4
-    n_heads: int = 8
-    ff_mult: int = 4
+    """Parameters for the PokeTransformer/PokeNet architecture."""
+    # Dedicated Embedding Sizes
+    emb_dims: Dict[str, int] = field(default_factory=lambda: {
+        "pokemon": 96,
+        "item": 96,
+        "ability": 96,
+        "move": 96,
+        "action": 12,
+    })
+    
+    # Dedicated Subnet Output Sizes
+    out_dims: Dict[str, int] = field(default_factory=lambda: {
+        "move_vec": 128,
+        "ability_vec": 128,
+        "pokemon_vec": 1024,
+        "global_vec": 128,
+        "transition_vec": 128,
+    })
+    
+    # Universal Embedding Bank Sizes
+    bank_dims: Dict[str, int] = field(default_factory=lambda: {
+        "val_100": 64,  # HP, Level, Acc, PP
+        "stat": 64,     # Base Stats, Weight, Height
+        "power": 64,    # Move Power
+    })
+    
+    # Vocabulary Safety Caps
+    bank_ranges: Dict[str, int] = field(default_factory=lambda: {
+        "val_100": 101,
+        "stat": 800,
+        "power": 251,
+    })
+    
     dropout: float = 0.0
-
-    def kwargs(self) -> Dict[str, Any]:
-        return dict(
-            model_dim=self.model_dim,
-            n_layers=self.n_layers,
-            n_heads=self.n_heads,
-            ff_mult=self.ff_mult,
-            dropout=self.dropout,
-        )
+    n_layers: int = 2
+    n_heads: int = 8
+    ff_expansion: float = 4.0
 
 
-# -------------------------
-# Environment / action space
-# -------------------------
 @dataclass(frozen=True)
 class EnvConfig:
+    """Pokemon Showdown environment settings."""
     battle_format: str = "gen9randombattle"
     act_dim: int = 14  # 4 moves + 4 tera moves + 6 switches
 
 
-# -------------------------
-# Rollout worker batching + timeouts
-# -------------------------
 @dataclass(frozen=True)
 class RolloutConfig:
-    
-    target_concurrent_battles: int = 3072
-    rooms_per_pair: int = 16
+    """Settings for distributed rollout workers and batching logic."""
+    target_concurrent_battles: int = 2048
+    rooms_per_pair: int = 32
 
+    # Timeouts
     infer_timeout_s: float = 15.0
     open_timeout: float = 30.0
-    ping_interval: float = 20.0
-    ping_timeout: float = 20.0
 
-    infer_min_batch: int = 32
-    infer_max_batch: int = 1024
-    infer_wait_ms: float = 1.0
+    # Batching constraints
+    infer_min_batch: int = 256
+    infer_max_batch: int = 2048
+    infer_wait_ms: float = 3.0
     infer_max_pending: int = 20000
 
     learn_min_episodes: int = 32
     learn_max_episodes: int = 256
     learn_wait_ms: float = 5.0
-    learn_max_pending_episodes: int = 256
-    learn_max_pending_batches: int = 256
+    learn_max_pending_episodes: int = 4096
+    learn_max_pending_batches: int = 4096
 
     def worker_kwargs(self) -> Dict[str, Any]:
-        # pass straight into your RolloutWorker/RayBatchedPlayer cfg
+        """Returns a dictionary suitable for RolloutWorker initialization."""
         return asdict(self)
 
 
-# -------------------------
-# Inference actor config
-# -------------------------
 @dataclass(frozen=True)
 class InferenceConfig:
+    """Config for the centralized inference server/actor."""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    server_min_batch: int = 0
+    server_max_wait: float = 0
 
     def kwargs(self) -> Dict[str, Any]:
-        return dict(device=self.device)
+        return {
+            "device": self.device,
+            "server_min_batch": self.server_min_batch,
+            "server_max_wait": self.server_max_wait,
+        }
 
-
-
-# -------------------------
-# Learner / PPO config (reuse your PPOConfig if you want)
-# -------------------------
 @dataclass(frozen=True)
 class LearnerConfig:
+    """Core PPO and Hyperparameter settings."""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    seed: int = 0
-
-    # PPO
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
+    mode: TrainingMode = "ppo"
     
-    lr: float = 3e-4
-    lr_warmup_steps: int = 60_000 # optimizer steps
-    lr_backbone_mult: float = 0.5
-    lr_pi_mult: float = 1.0
-    lr_v_mult: float = 1.0
-    weight_decay: float = 1e-4
+    # Reinforcement Learning Math
+    gamma: float = 0.9999
+    gae_lambda: float = 0.75
     
-    update_epochs: int = 4
-    minibatch_size: int = 512
+    # Distributional Value (Two-Hot Encoding)
+    use_twohot_value: bool = True
+    v_min: float = -1.6
+    v_max: float = 1.6
+    v_bins: int = 51
+    
+    # Schedules
+    temp_start: float = 1.0
+    temp_end: float = 0.9
+    temp_total_steps: int = 500_000
+    
+    # Optimizer settings
+    lr: float = 1e-4
+    lr_warmup_steps: int = 1_000
+    lr_hold_steps: int = 20_000
+    lr_total_steps: int = 500_000
+    weight_decay: float = 1e-2
+    
+    # Layer-specific LR multipliers (initialized in __post_init__)
+    lr_backbone_mult: float = field(init=False)
+    lr_pi_mult: float = field(init=False)
+    lr_v_mult: float = field(init=False)
+    
+    # PPO Specifics
+    update_epochs: int = 3
+    minibatch_size: int = 4096
     clip_coef: float = 0.2
-    ent_coef: float = 0.01
-    vf_coef: float = 1.0
+    ent_coef: float = 0.02
+    vf_coef: float = 0.5
     clip_vloss: bool = False
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.02
-
-    # update trigger
     steps_per_update: int = 32768
 
-    # checkpointing
+    # Checkpointing
     ckpt_dir: str = "checkpoints"
     save_every_updates: int = 25
     keep_last: int = 500
     resume: bool = True
+    
+    # Auxiliary Tasks
+    use_hp_aux: bool = False
+    hp_aux_coef: float = 0.4
+
+    def __post_init__(self):
+        """Sets gradient multipliers based on the current TrainingMode."""
+        # Use object.__setattr__ because the dataclass is frozen
+        multipliers = {
+            "imitation": (1.0, 1.0, 0.0),
+            "warmup": (0.0, 0.0, 1.0),
+            "ppo": (1.0, 1.0, 1.0),
+        }
+        backbone, pi, v = multipliers.get(self.mode, (1.0, 1.0, 1.0))
+        
+        object.__setattr__(self, "lr_backbone_mult", backbone)
+        object.__setattr__(self, "lr_pi_mult", pi)
+        object.__setattr__(self, "lr_v_mult", v)
+
+    def get_temp(self, global_step: int) -> float:
+        """Calculates linear annealing of the action temperature."""
+        if global_step >= self.temp_total_steps:
+            return self.temp_end
+        frac = global_step / self.temp_total_steps
+        return self.temp_start + frac * (self.temp_end - self.temp_start)
 
     def ppo_kwargs(self) -> Dict[str, Any]:
-        return dict(
-            update_epochs=self.update_epochs,
-            minibatch_size=self.minibatch_size,
-            clip_coef=self.clip_coef,
-            ent_coef=self.ent_coef,
-            vf_coef=self.vf_coef,
-            clip_vloss=self.clip_vloss,
-            max_grad_norm=self.max_grad_norm,
-            target_kl=self.target_kl,
-        )
+        """Extracts PPO-specific hyperparameters for the optimizer."""
+        keys = ["update_epochs", "minibatch_size", "clip_coef", "ent_coef", 
+                "vf_coef", "clip_vloss", "max_grad_norm", "target_kl"]
+        return {k: getattr(self, k) for k in keys}
+
 
 @dataclass(frozen=True)
 class RewardConfig:
-    # terminal result reward 
+    """Defines the reward signal for the agent."""
     terminal_win: float = 1.0
     terminal_loss: float = -1.0
-
-    # ---- optional faint shaping ----
     use_faint_reward: bool = True
-    faint_self: float = -0.1     # penalty when one of *your* mons faints
-    faint_opp: float = +0.1      # bonus when an *opponent* mon faints
-    
-# -------------------------
-# Top-level run config
-# -------------------------
+    faint_self: float = -0.1
+    faint_opp: float = +0.1
+
+
 @dataclass(frozen=True)
 class RunConfig:
+    """The master configuration object coordinating all sub-configs."""
     obs: ObsConfig
     model: ModelConfig
     env: EnvConfig
@@ -388,9 +222,10 @@ class RunConfig:
     learner: LearnerConfig
     reward: RewardConfig
 
-    @staticmethod
-    def default() -> "RunConfig":
-        return RunConfig(
+    @classmethod
+    def default(cls) -> RunConfig:
+        """Factory method for default settings."""
+        return cls(
             obs=ObsConfig(),
             model=ModelConfig(),
             env=EnvConfig(),
@@ -400,39 +235,42 @@ class RunConfig:
             reward=RewardConfig(),
         )
 
-    # ----- factories / adapters -----
+    def make_model(self) -> nn.Module:
+        """
+        Instantiates the PokeTransformer model based on current configuration.
+        
+        Returns:
+            nn.Module: An initialized model ready for training or inference.
+        
+        Raises:
+            ImportError: If required core modules are missing.
+        """
+        try:
+            from obs_assembler import ObservationAssembler
+            from ppo_core import PokeTransformer
+        except ImportError as e:
+            logger.error(f"Failed to import model components: {e}")
+            raise
 
-    def make_model(self):
-        # centralized place to build ActorCriticTransformer
-        from ppo_core import ActorCriticTransformer
-        return ActorCriticTransformer(
-            act_dim=self.env.act_dim,
-            **self.model.kwargs(),
-            **self.obs.model_kwargs(),
+        # Derive schema metadata (Source of Truth for input sizes)
+        assembler = ObservationAssembler()
+        meta = assembler.get_schema_metadata()
+        meta["offsets"] = assembler.offsets
+
+        return PokeTransformer(
+            act_dim=int(self.env.act_dim),
+            meta=meta,
+            emb_dims=self.model.emb_dims,
+            out_dims=self.model.out_dims,
+            bank_dims=self.model.bank_dims,
+            bank_ranges=self.model.bank_ranges,
+            n_heads=self.model.n_heads,
+            n_layers=self.model.n_layers,
+            v_bins=int(self.learner.v_bins),
+            ff_expansion=self.model.ff_expansion,
+            dropout=self.model.dropout,
         )
-
-    def inference_actor_kwargs(self) -> Dict[str, Any]:
-        # kwargs for InferenceActor(...)
-        return dict(
-            act_dim=self.env.act_dim,
-            **self.model.kwargs(),
-            **self.obs.model_kwargs(),
-            **self.infer.kwargs(),
-        )
-
-    def rollout_worker_kwargs(self) -> Dict[str, Any]:
-        # kwargs used when constructing RolloutWorker(cfg=..., ...)
-        return dict(
-            battle_format=self.env.battle_format,
-            act_dim=self.env.act_dim,
-            **self.rollout.worker_kwargs(),
-        )
-    
-    def learner_actor_kwargs(self) -> Dict[str, Any]:
-        # kwargs for LearnerActor(cfg=..., inference_actor=...)
-        # You’ll likely pass the whole RunConfig anyway; this is here if you prefer slices.
-        return dict()
-
 
     def as_dict(self) -> Dict[str, Any]:
+        """Converts the entire configuration tree to a dictionary."""
         return asdict(self)
