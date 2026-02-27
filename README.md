@@ -14,7 +14,7 @@ From a reinforcement learning perspective, the Pokémon Showdown random battle e
 2. **Imperfect Information:** The opponent's team composition, movesets, abilities, and exact statistical distributions (EVs/IVs) are obfuscated until revealed during gameplay. The agent must maintain implicit belief states over hidden variables.
 3. **High Stochasticity:** The environment features random team composition and move sets, critical hit probabilities, and secondary effect triggers (e.g., accuracy checks or a 10% probability to freeze). Tactically optimal decisions carry non-zero probabilities of failure.
 
-These variables are rarely present simultaneously in traditional RL benchmarks (such as Chess or Go). They are, however, present in many real-world environments, classic games like poker, and in multi-agent auto-battlers like Teamfight Tactics (TFT). To isolate and test algorithmic responses to these specific environmental hurdles with less computational overhead, I have developed a simple version of TFT: [SimpleTFT](https://www.google.com/search?q=https://github.com/your-username-here/simpletft).
+These variables are rarely present simultaneously in traditional RL benchmarks (such as Chess or Go). They are, however, present in many real-world environments, classic games like poker, and in multi-agent auto-battlers like Teamfight Tactics (TFT). To isolate and test algorithmic responses to these specific environmental hurdles with less computational overhead, I have developed a simple version of TFT: [SimpleTFT](https://github.com/Nebraskinator/SimpleTFTEnv).
 
 ## Previous Work
 
