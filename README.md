@@ -22,25 +22,23 @@ A review of the literature regarding Pokémon Showdown AI reveals that the highe
 
 While these publications report high win rates, they require a near-perfect simulation engine to calculate the best moves. There are many environments, including the real-world, where a near-perfect simulation is infeasible. 
 
-Wang et al. trained an MLP using PPO in his work, but ultimately relied on MCTS using a game engine guided by the trained policy evaluate actions. I trained a similar (MLP) architecture using the hyperparameters detailed in Wang's work without the MCTS component to evaluate the network purely as a standalone policy. Under these conditions, the replicated MLP agent plateaued at approximately 1100 ELO. This suggests that the MLP architecture struggled to internalize the tactical depth required by the environment, instead relying heavily on engine-assisted search to compute decision boundaries.
+[Wang] (https://dspace.mit.edu/handle/1721.1/153888) trained an MLP using PPO in his work, but ultimately relied on MCTS using a game engine guided by the trained policy to choose actions. I trained a similar (MLP) architecture using the hyperparameters detailed in Wang's work without the MCTS component to evaluate the network purely as a standalone policy. Under these conditions, the replicated MLP agent plateaued at approximately 1100 ELO. This suggests that the MLP architecture struggled to internalize the tactical depth required by the environment, instead relying heavily on engine-assisted search to compute decision boundaries.
 
 ## Architectural Motivation: The Case for Transformers
 
 A Pokémon battle state is not effectively represented as a flattened 1D array of floats. It is a highly structured, relational set of discrete entities. Flattening 12 Pokémon, their discrete moves, and global field effects destroys the semantic geometry of the state space.
 
-Transformers are natively designed to process sets of tokens and model relationships between them. By modeling the game state as a sequence of discrete embeddings (1 Field Token, 12 Pokémon Tokens), the Self-Attention mechanism allows the network to dynamically route tactical information. For example, the model can learn to heavily attend its Active Pokémon's "Move Token" to the opponent's Active "Type Token" to natively calculate type matchups within the latent space.
-
-
+Transformers are natively designed to process sets of tokens and model relationships between them. By modeling the game state as a sequence of discrete embeddings (1 Field Token, 12 Pokémon Tokens), the Self-Attention mechanism allows the network to dynamically route tactical information. For example, an agent can evaluate potential switch-out candidates by attending to the current active pokemon of the opponent.
 
 ## Methodology and Results
 
 To address the sparse reward problem and bootstrap the agent's representation of foundational mechanics, training was conducted in two distinct phases:
 
-1. **Behavioral Cloning (Imitation Learning):** An initial dataset was generated using the programmatic heuristic bots provided in the `poke-env` library (specifically `SimpleHeuristicsPlayer`). The Transformer was trained via cross-entropy loss to predict the heuristic actions, establishing a baseline of legal and generally logical play.
-2. **Proximal Policy Optimization (PPO):** Following the imitation phase, the model transitioned to distributed self-play using Ray. The agent was trained on >150M states over the course of 2 days on a consumer PC (RTX 3090).
+1. **Behavioral Cloning (Imitation Learning):** An initial dataset was generated using the programmatic heuristic bots provided in the `poke-env` library (specifically `SimpleHeuristicsPlayer`). The Transformer was trained via cross-entropy loss to predict the heuristic actions, establishing a baseline of legal and generally logical play. This step was critical when designing the network architecture and tuning hyperparameters. The ability to perfecty imitate the SimpleHeuristicPlayer requires modeling complex interactions to identify hard decision boundaries. Configurations that failed to imitate perfectly were discarded.
+2. **Proximal Policy Optimization (PPO):** Following the imitation phase, the model transitioned to distributed self-play using Ray. The agent was trained on >250M states over the course of 2 days on a consumer PC (RTX 3090). The reward was shaped to promote winning (+/-1 for win/loss) by a large margin (+/-0.1 for faint).
 
 **Results:**
-The resulting agent achieved a >85% winrate against the SimpleHeuristicsPlayer and a rating exceeding **1600 ELO on the Generation 9 Random Battle ladder.** To my knowledge, this represents the highest documented performance for a pure neural policy in Pokémon Showdown. During inference, the agent does not utilize MCTS, Expectimax, or external programmatic damage calculators. The raw observation tensor is processed, and the optimal tactical action is sampled from the output distribution in a single forward pass.
+The resulting agent achieved a >85% winrate against the SimpleHeuristicsPlayer and a rating exceeding **1900 ELO on the Generation 9 Random Battle ladder.** To my knowledge, this represents the highest documented performance for a pure neural policy in Pokémon Showdown. During inference, the agent does not utilize MCTS, Expectimax, or external programmatic damage calculators. The raw observation tensor is processed, and the optimal tactical action is sampled from the output distribution in a single forward pass.
 
 ![Agent ELO](./ppobot.png)
 
