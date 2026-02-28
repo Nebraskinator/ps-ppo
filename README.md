@@ -38,7 +38,7 @@ To address the sparse reward problem and bootstrap the agent's representation of
 2. **Proximal Policy Optimization (PPO):** Following the imitation phase, the model transitioned to distributed self-play using Ray. The agent was trained on >250M states over the course of 2 days on a consumer PC (RTX 3090). The reward was shaped to promote winning (+/-1 for win/loss) by a large margin (+/-0.1 for faint).
 
 **Results:**
-The resulting agent achieved a >85% winrate against the SimpleHeuristicsPlayer and a rating exceeding **1900 ELO on the Generation 9 Random Battle ladder.** To my knowledge, this represents the highest documented performance for a pure neural policy in Pokémon Showdown. During inference, the agent does not utilize MCTS, Expectimax, or external programmatic damage calculators. The raw observation tensor is processed, and the optimal tactical action is sampled from the output distribution in a single forward pass.
+The resulting agent achieved a >85% winrate against the SimpleHeuristicsPlayer and a rating exceeding **1900 ELO on the Generation 9 Random Battle ladder.** To my knowledge, this represents the highest documented performance for a pure neural policy in Pokémon Showdown. During inference, the agent does not utilize MCTS, Expectimax, or external programmatic damage calculators. The raw observation tensor is processed, and the optimal tactical action is sampled from the output distribution in a single forward pass. 
 
 ![Agent ELO](./ppobot.png)
 
