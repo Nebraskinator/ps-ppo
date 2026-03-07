@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Final
 
+from utils import get_id
+
 # Configure logger
 logger = logging.getLogger(__name__)
 
@@ -56,7 +58,6 @@ def encode_transitions_inplace(
         return
 
     first_action_seen = False
-    move_vocab = vocab.get("move.id", {})
 
     for event in events:
         # Standard protocol validation: [timestamp, command, actor, ...]
@@ -86,7 +87,7 @@ def encode_transitions_inplace(
             if len(event) > 3:
                 move_name = event[3]
                 # Write the categorical Move ID
-                buffer[id_start + side_idx] = move_vocab.get(move_name.lower().replace(" ", ""), 0)
+                buffer[id_start + side_idx] = get_id(vocab, "move.id", move_name)
                 
                 # Identify move order
                 if not first_action_seen:
