@@ -250,10 +250,13 @@ class ObservationAssembler:
         return 0
 
     @staticmethod
-    def get_schema_metadata(vocab_lists: Dict[str, List[str]]) -> Dict[str, Any]:
+    def get_schema_metadata(vocab_lists: Dict[str, List[str]]=None) -> Dict[str, Any]:
         """
         Generates schema offsets to remove magic numbers from model architecture.
         """
+        if vocab_lists is None:
+            with open("vocab.json", "r") as f:
+                vocab_lists = json.load(f)
         v_type = len(vocab_lists["pokemon.type"]) + 1
         v_effect = len(vocab_lists["pokemon.effect"]) + 1
         v_status = len(vocab_lists["pokemon.status"]) + 1
@@ -284,6 +287,7 @@ class ObservationAssembler:
         return {
             "dim_pokemon_body": dim_pokemon_body,
             "dim_move_scalars": dim_move_scalars,
+            "dim_transition_scalars": 10,
             "dim_global_scalars": 3 + (len(vocab_lists["global.weather"]) + 11) + (v_type * 2),
             "feature_map": {"body": body_map, "move": move_map, "global": {"turn_int": 0, "remainder_raw": (1, None)}},
             "faint_internal_idx": 101 + 1,
@@ -292,5 +296,8 @@ class ObservationAssembler:
             "vocab_ability": len(vocab_lists["pokemon.ability"]) + 1,
             "vocab_move": len(vocab_lists["move.id"]) + 1,
             "action_dim": 14,
-            "n_pokemon_slots": 12
+            "n_pokemon_slots": 12,
+            "n_move_slots": 4,
+            "n_ability_slots": 4,
+            "n_transition_moves": 2,
         }

@@ -378,6 +378,9 @@ class AsyncEpisodeDataset:
             torch.cat(self.next_hp, dim=0).float()
         )
         return self._tensor_cache
+    
+    def swap_out_tensor_cache(self):
+        data = self.tensorize(); self.clear(); return data
 
     def iter_minibatches(self, mb_size: int) -> Iterator[Tuple]:
         obs, act, logp, val, adv, ret, next_hp = self.tensorize()
@@ -387,10 +390,35 @@ class AsyncEpisodeDataset:
             mb = idx[start : start + mb_size]
             yield obs[mb], act[mb], logp[mb], val[mb], adv[mb], ret[mb], next_hp[mb]
 
+@torch.no_grad()
+def gae_from_episode(
+    rewards: torch.Tensor,     # [T]
+    values: torch.Tensor,      # [T]
+    dones: torch.Tensor,       # [T] (1 at terminal step)
+    gamma: float,
+    lam: float,
+    last_value: float = 0.0,   # terminal -> 0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes GAE for one episode.
+    """
+    T = rewards.shape[0]
+    adv = torch.zeros((T,), device=rewards.device)
+    gae = torch.tensor(0.0, device=rewards.device)
+    for t in reversed(range(T)):
+        next_nonterminal = 1.0 - dones[t]
+        next_value = torch.tensor(last_value, device=rewards.device) if (t == T - 1) else values[t + 1]
+        delta = rewards[t] + gamma * next_value * next_nonterminal - values[t]
+        gae = delta + gamma * lam * next_nonterminal * gae
+        adv[t] = gae
+    ret = adv + values
+    return adv, ret
+
 def ppo_update(
     net: nn.Module,
     opt: optim.Optimizer,
     dataset: AsyncEpisodeDataset,
+    scheduler=None,
     mode: str = "ppo",
     **cfg
 ) -> PPOUpdateStats:
@@ -402,6 +430,7 @@ def ppo_update(
     dev = next(net.parameters()).device
     stats = {k: 0.0 for k in ["kl", "clip", "ent", "v", "pg", "total"]}
     n_mb = 0
+    stop_training = False
     
     for epoch in range(cfg.get("update_epochs", 1)):
         epoch_kl, epoch_mb = 0.0, 0
@@ -437,6 +466,8 @@ def ppo_update(
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), cfg["max_grad_norm"])
             opt.step()
+            if scheduler is not None:
+                scheduler.step()
 
             # Stats update
             n_mb += 1; epoch_mb += 1
@@ -446,7 +477,11 @@ def ppo_update(
 
             if mode == "ppo" and cfg.get("target_kl") and (epoch_kl / epoch_mb) > cfg["target_kl"] * 1.5:
                 logger.info(f"Early stop at Epoch {epoch} due to KL {epoch_kl/epoch_mb:.4f}")
-                return PPOUpdateStats(**{f"{k}_loss" if k in ["v", "pg", "hp"] else k: v/n_mb for k, v in stats.items()}, n_mb=n_mb, hp_loss=0.0)
+                stop_training = True
+                break
+            
+        if stop_training:
+            break
 
     return PPOUpdateStats(
         approx_kl=stats["kl"]/n_mb, clip_frac=stats["clip"]/n_mb, entropy=stats["ent"]/n_mb,

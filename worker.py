@@ -30,7 +30,6 @@ from ray.exceptions import ActorUnavailableError, GetTimeoutError
 
 from config import RunConfig
 from obs_assembler import ObservationAssembler
-from policy_router import PolicyRouter
 
 # Global Constants
 GET_TIMEOUT_S: Final[float] = 8.0
@@ -202,14 +201,13 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
     and records trajectories for PPO training.
     """
     def __init__(self, infer_client: WorkerInferenceClient, learn_client: WorkerLearnerClient, 
-                 agent_id: int, cfg: RunConfig, policy_router: Optional[PolicyRouter] = None, **kwargs):
+                 agent_id: int, cfg: RunConfig, **kwargs):
         super().__init__(**kwargs)
         self.infer_client = infer_client
         self.learn_client = learn_client
         self.agent_id = agent_id
         self.cfg = cfg
         self.assembler = ObservationAssembler()
-        self.policy_router = policy_router
         
         self._episode_slot_acquired: set[str] = set()
         self._traj: Dict[str, Dict[str, List[Any]]] = {}
@@ -228,7 +226,7 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
             self._episode_slot_acquired.add(tag)
 
         obs_flat = self.assembler.assemble(battle)
-        policy_id = self.policy_router.resolve_policy_id(self.agent_id, tag) if self.policy_router else 0
+        policy_id = 0
 
         # Decide: Heuristic (Imitation) or Model (PPO)
         if self.cfg.learner.mode == "imitation":
@@ -260,7 +258,9 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
     def _process_experience(self, battle, tag: str):
         """Calculates rewards and submits the completed trajectory to the Learner."""
         buf = self._traj[tag]
-        if not buf["act"]: return
+        if not buf["act"]: 
+            self.learn_client.drop_episode()
+            return
 
         T = len(buf["act"])
         obs_stacked = np.stack(buf["observations"], axis=0)
@@ -289,7 +289,6 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
         self._last_act_time.pop(tag, None)
         self._traj.pop(tag, None)
         if tag in self._episode_slot_acquired:
-            self.learn_client.drop_episode()
             self._episode_slot_acquired.remove(tag)
 
     async def run_reconciliation(self):
@@ -349,3 +348,25 @@ class RolloutWorker:
             max_concurrent_battles=self.cfg.rollout.rooms_per_pair,
             start_listening=True
         )
+    
+    async def heartbeat(self):
+        # Measure Event Loop Lag
+        t0 = time.time()
+        await asyncio.sleep(0) # Yield to loop
+        lag = (time.time() - t0) * 1000 # Milliseconds
+        
+        total_active = 0
+        total_lib_count = 0 
+        
+        for pA, pB in self.active_pairs:
+            total_active += pA.get_debug_stats() + pB.get_debug_stats()
+            # Peek into private library counts
+            if hasattr(pA, "_battles"): total_lib_count += len(pA._battles)
+            if hasattr(pB, "_battles"): total_lib_count += len(pB._battles)
+        
+        return {
+            "run_tag": self.run_tag,
+            "active_battles_worker": total_active,
+            "active_battles_library": total_lib_count, # Compare this to worker!
+            "loop_lag_ms": round(lag, 2),
+        }

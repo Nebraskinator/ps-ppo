@@ -17,6 +17,7 @@ import random
 import traceback
 from typing import Dict, List, Optional, Tuple, Final
 
+import ray
 import numpy as np
 import torch
 import torch.nn as nn
@@ -150,32 +151,6 @@ class LearnerActor:
 
         self.sched = optim.lr_scheduler.LambdaLR(self.opt, lr_lambda=lr_lambda)
 
-    @torch.no_grad()
-    def _resuscitate_surgical(self, threshold: float = 1e-4, dampening: float = 0.001):
-        """
-        Revives 'dead' neurons in the network.
-        
-        Scans Linear and Embedding layers for neurons with near-zero weight 
-        magnitudes and resets them using Kaiming initialization to restore 
-        gradient flow.
-        """
-        logger.info(f"Initiating surgical resuscitation (threshold={threshold})")
-        for name, module in self.net.named_modules():
-            if isinstance(module, (nn.Linear, nn.Embedding)):
-                mags = module.weight.abs().mean(dim=1)
-                dead_mask = mags < threshold
-                if dead_mask.any():
-                    fresh = torch.empty_like(module.weight)
-                    if isinstance(module, nn.Linear):
-                        nn.init.kaiming_uniform_(fresh, a=np.sqrt(5))
-                    else:
-                        nn.init.normal_(fresh, std=0.02)
-                    
-                    module.weight[dead_mask] = fresh[dead_mask] * dampening
-                    if hasattr(module, 'bias') and module.bias is not None:
-                        module.bias[dead_mask] = 0.0
-                    logger.info(f"Revived {dead_mask.sum().item()} neurons in {name}")
-
     async def _loop(self):
         """
         The main training orchestration loop.
@@ -259,11 +234,23 @@ class LearnerActor:
             # 5. Checkpointing
             if self.update_idx % self.cfg.save_every_updates == 0:
                 self._save_checkpoint(self._ckpt_path_for_update(self.update_idx))
-                self.inference_actor.refresh_snapshots_from_disk.remote()
 
         except Exception as e:
             logger.error(f"PPO Update failed: {e}")
             self.dataset.clear()
+            
+    async def submit_packed_batch(
+        self,
+        obs_cat: np.ndarray,
+        act_cat: np.ndarray,   # [S]
+        logp_cat: np.ndarray,  # [S]
+        val_cat: np.ndarray,   # [S]
+        rew_cat: np.ndarray,   # [S]
+        done_cat: np.ndarray,  # [S]
+        lengths: np.ndarray,   # [B]
+    ):
+        await self._q.put(("packed", obs_cat, act_cat, logp_cat, val_cat, rew_cat, done_cat, lengths))
+        return True
 
     def _save_checkpoint(self, path: str):
         """Serializes model, optimizer, and RNG states to disk."""
@@ -289,3 +276,11 @@ class LearnerActor:
         if not task.cancelled() and task.exception():
             logger.critical("Learner training loop CRASHED!")
             traceback.print_exception(None, task.exception(), None)
+            
+    async def get_stats(self) -> dict:
+        return {
+            "update": self.update_idx,
+            "episodes": self.total_episodes,
+            "steps_in_dataset": len(self.dataset),
+            "total_steps": self.total_steps,
+        }

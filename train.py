@@ -98,7 +98,7 @@ async def main():
             cfg_ref,
             infer,
             learner,
-            pairs_in_worker=count,
+            pairs=count,
             server_port=port,
         )
         workers.append(worker_actor)
@@ -111,7 +111,7 @@ async def main():
     await asyncio.sleep(20)
     
     # Launch asynchronous rollout tasks
-    _ = [w.run.remote(rooms_per_pair=rooms_per_pair) for w in workers]
+    _ = [w.run.remote() for w in workers]
 
     # 5. Monitoring Loop
     logger.info("Training started. Entering telemetry loop.")

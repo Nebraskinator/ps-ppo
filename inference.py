@@ -2,16 +2,13 @@
 Inference Server and Model Management for Distributed RL.
 
 This module provides the InferenceActor, which handles large-batch GPU forward 
-passes, and utility functions for "Geometric Snapshotting"—the process of 
-selecting past model versions to maintain a diverse league for self-play.
+passes
 """
 
 from __future__ import annotations
 
-import glob
 import logging
 import os
-import random
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Final
@@ -59,60 +56,6 @@ def _extract_state_dict(ckpt: dict) -> dict:
         return ckpt
         
     raise RuntimeError("Could not find a model state_dict inside the checkpoint file.")
-
-
-def _pick_geometric_ckpts(
-    ckpt_dir: str, 
-    *, 
-    n_snapshots: int, 
-    min_stride: int = 100,
-    base: float = 2.0, 
-    jitter: int = 100
-) -> List[str]:
-    """
-    Selects a historical set of checkpoints based on a geometric distribution.
-    
-    This ensures the 'league' contains a mix of very recent and very old 
-    versions of the agent, preventing policy cycling and improving robustness.
-    """
-    paths = glob.glob(os.path.join(ckpt_dir, "learner_update_*.pt"))
-    if not paths:
-        return []
-
-    # Map paths to update numbers
-    updates = []
-    for p in paths:
-        if m := CKPT_UPDATE_PATTERN.search(p):
-            updates.append((p, int(m.group(1))))
-    
-    if not updates:
-        return sorted(paths)[-n_snapshots:]
-
-    updates.sort(key=lambda x: x[1])
-    latest_path, latest_u = updates[-1]
-    
-    chosen = [latest_path]
-    used = {latest_path}
-    
-    for i in range(1, n_snapshots + 1):
-        # Calculate geometric target: current - (stride * base^i)
-        delta = int(round(min_stride * (base ** (i - 1))))
-        target = max(0, latest_u - delta)
-        
-        # Find the checkpoint closest to the target update number
-        window = [p for p, u in updates if abs(u - target) <= jitter and p not in used]
-        if window:
-            cand = random.choice(window)
-        else:
-            # Fallback to absolute nearest
-            cand = min(updates, key=lambda x: abs(x[1] - target))[0]
-        
-        chosen.append(cand)
-        used.add(cand)
-        
-    return chosen
-
-
 @dataclass
 class InferenceStats:
     """Container for monitoring inference performance and throughput."""
@@ -153,7 +96,6 @@ class InferenceActor:
         self.cfg = cfg
         self.weight_store = weight_store
         self.device: Final[str] = str(cfg.infer.device)
-        self.n_snapshots: Final[int] = int(getattr(cfg.router, "n_snapshots", 0))
         
         self.current_version = -1
         self.current_temp = cfg.learner.temp_start
@@ -161,10 +103,6 @@ class InferenceActor:
         
         # Build main model and league models
         self.net = self.cfg.make_model().to(self.device).eval()
-        self.snapshot_nets = [
-            self.cfg.make_model().to(self.device).eval() 
-            for _ in range(self.n_snapshots)
-        ]
         
         # Initial load
         self.resume_from_disk()
@@ -198,12 +136,12 @@ class InferenceActor:
         val_out = torch.zeros(B, dtype=torch.float32, device=self.device)
 
         # Process by Policy ID (0 = Latest, 1..N = Snapshots)
-        for pid in range(self.n_snapshots + 1):
+        for pid in range(1):
             mask = (p_ids == pid)
             if not mask.any():
                 continue
 
-            model = self.net if pid == 0 else self.snapshot_nets[pid-1]
+            model = self.net
             obs_sub = obs[mask]
             
             logits, _, value = model(obs_sub)
@@ -227,6 +165,9 @@ class InferenceActor:
             logp_out.cpu().numpy(),
             val_out.cpu().numpy()
         )
+    
+    def set_temp(self, temp: float):
+        self.current_temp = temp
 
     def _sync_weights(self):
         """Pulls updated weights from the WeightStore if a new version is available."""
@@ -250,18 +191,15 @@ class InferenceActor:
             return
 
         # Load historical snapshots for the league
-        paths = _pick_geometric_ckpts(ckpt_dir, n_snapshots=self.n_snapshots)
+        paths = [ckpt_dir]
         for i, p in enumerate(paths):
             try:
                 st = _extract_state_dict(torch.load(p, map_location="cpu"))
                 if i == 0: # The most recent one in the list
                     self.net.load_state_dict(st)
-                else:
-                    if i-1 < self.n_snapshots:
-                        self.snapshot_nets[i-1].load_state_dict(st)
             except Exception as e:
                 logger.error(f"Failed to load checkpoint {p}: {e}")
-
+                
     def get_stats(self) -> dict:
         """Returns diagnostic metrics."""
         return {
