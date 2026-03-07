@@ -132,7 +132,7 @@ async def main():
             # Aggregate worker-side metrics
             total_active = sum(w.get("active_battles_worker", 0) for w in wstats_list)
             total_library = sum(w.get("active_battles_library", 0) for w in wstats_list)
-            avg_lag = sum(w.get("loop_lag_ms", 0) for w in wstats_list) / len(wstats_list)
+            avg_lag = sum(w.get("loop_lag_ms", 0) for w in wstats_list) / max(len(wstats_list), 1)
 
             # Professional telemetry print
             # wbat: battles tracked by worker, pbat: battles tracked by poke-env library

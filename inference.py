@@ -110,60 +110,34 @@ class InferenceActor:
     @torch.no_grad()
     def infer_batch(self, policy_ids_np: np.ndarray, obs_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Executes a batch forward pass.
-        
-        Args:
-            policy_ids_np: Int array mapping each observation to a specific model version.
-            obs_np: Flattened observation matrix.
-            
-        Returns:
-            Tuple: (actions, log_probabilities, value_estimates)
+        Executes a batch forward pass for a single policy, ignoring legacy policy IDs.
         """
         self._sync_weights()
         
-        B = policy_ids_np.shape[0]
+        B = obs_np.shape[0]
         self.stats.flushes += 1
         self.stats.total_requests += B
         self.stats.avg_batch_size = (self.stats.avg_batch_size * 0.95) + (B * 0.05)
 
-        # Transfer to GPU
-        p_ids = torch.from_numpy(policy_ids_np).to(self.device)
         obs = torch.from_numpy(obs_np).to(self.device)
 
-        # Pre-allocate output buffers
-        act_out = torch.zeros(B, dtype=torch.long, device=self.device)
-        logp_out = torch.zeros(B, dtype=torch.float32, device=self.device)
-        val_out = torch.zeros(B, dtype=torch.float32, device=self.device)
+        # Single forward pass for the entire batch
+        logits, _, value = self.net(obs)
+        
+        # Extract Action Mask
+        m_start, m_end = self.net.unpacker.offsets["action_mask"]
+        mask_sub = obs[:, m_start:m_end].float()
+        
+        # Sample actions
+        act, logp, _ = masked_sample(logits, mask_sub, temp=self.current_temp)
 
-        # Process by Policy ID (0 = Latest, 1..N = Snapshots)
-        for pid in range(1):
-            mask = (p_ids == pid)
-            if not mask.any():
-                continue
-
-            model = self.net
-            obs_sub = obs[mask]
-            
-            logits, _, value = model(obs_sub)
-            
-            # Extract Action Mask from observations
-            m_start, m_end = model.unpacker.offsets["action_mask"]
-            mask_sub = obs_sub[:, m_start:m_end].float()
-            
-            # Sampling with safety valve for empty masks
-            act, logp, _ = masked_sample(logits, mask_sub, temp=self.current_temp)
-            
-            act_out[mask] = act
-            logp_out[mask] = logp
-            val_out[mask] = value
-
-        # Force sync to ensure results are ready before returning to CPU
+        # Sync before returning to CPU
         torch.cuda.synchronize()
         
         return (
-            act_out.cpu().numpy(),
-            logp_out.cpu().numpy(),
-            val_out.cpu().numpy()
+            act.cpu().numpy(),
+            logp.cpu().numpy(),
+            value.cpu().numpy()
         )
     
     def set_temp(self, temp: float):
@@ -182,7 +156,7 @@ class InferenceActor:
                 logger.info(f"InferenceActor synced to version {version}")
 
     def resume_from_disk(self):
-        """Initializes the actor with weights found in the checkpoint directory."""
+        """Initializes the actor with the latest weights found in the checkpoint directory."""
         if not getattr(self.cfg.learner, "resume", False):
             return
 
@@ -190,15 +164,28 @@ class InferenceActor:
         if not os.path.exists(ckpt_dir):
             return
 
-        # Load historical snapshots for the league
-        paths = [ckpt_dir]
-        for i, p in enumerate(paths):
-            try:
-                st = _extract_state_dict(torch.load(p, map_location="cpu"))
-                if i == 0: # The most recent one in the list
-                    self.net.load_state_dict(st)
-            except Exception as e:
-                logger.error(f"Failed to load checkpoint {p}: {e}")
+        # Find all checkpoints and load the most recent one
+        import glob
+        paths = sorted(glob.glob(os.path.join(ckpt_dir, "learner_update_*.pt")))
+        
+        if not paths:
+            return
+            
+        latest_ckpt = paths[-1]
+        try:
+            st = _extract_state_dict(torch.load(latest_ckpt, map_location="cpu"))
+            self.net.load_state_dict(st)
+            logger.info(f"InferenceActor resumed from {latest_ckpt}")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint {latest_ckpt}: {e}")
+            
+    def refresh_snapshots_from_disk(self):
+        """
+        Legacy endpoint for the LearnerActor. 
+        In a single-policy setup, dynamic disk reloading is unnecessary because 
+        the latest weights are synced continuously via RAM (WeightStore).
+        """
+        pass
                 
     def get_stats(self) -> dict:
         """Returns diagnostic metrics."""

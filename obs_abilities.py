@@ -79,4 +79,4 @@ def encode_ability_inplace(
                 break
             except Exception as e:
                 logger.debug(f"Error encoding possible ability slot {i} for {mon.species}: {e}")
-                break
+                continue

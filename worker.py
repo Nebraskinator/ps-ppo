@@ -159,11 +159,11 @@ class WorkerInferenceClient:
         self._q: asyncio.Queue = asyncio.Queue(maxsize=self.cfg.infer_max_pending)
         self._task = asyncio.get_event_loop().create_task(self._loop())
 
-    async def request(self, obs_flat: np.ndarray, policy_id: int = 0) -> Tuple[int, float, float]:
+    async def request(self, obs_flat: np.ndarray) -> Tuple[int, float, float]:
         """Submits an observation and waits for the action result."""
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
-        await self._q.put((fut, int(policy_id), obs_flat))
+        await self._q.put((fut, obs_flat))
         return await fut
 
     async def _loop(self):
@@ -176,17 +176,16 @@ class WorkerInferenceClient:
                     try: items.append(self._q.get_nowait())
                     except asyncio.QueueEmpty: break
 
-                obs_batch = np.stack([it[2] for it in items], axis=0)
-                p_ids = np.array([it[1] for it in items], dtype=np.int64)
+                obs_batch = np.stack([it[1] for it in items], axis=0)
 
                 try:
                     # Await Ray ObjectRef directly for performance
-                    act, logp, val = await self.inference_actor.infer_batch.remote(p_ids, obs_batch)
-                    for i, (fut, *_) in enumerate(items):
+                    act, logp, val = await self.inference_actor.infer_batch.remote(obs_batch)
+                    for i, (fut, _) in enumerate(items):
                         if not fut.done(): fut.set_result((int(act[i]), float(logp[i]), float(val[i])))
                 except (GetTimeoutError, ActorUnavailableError) as e:
                     logger.warning(f"Inference Actor busy/dead: {e}")
-                    for fut, *_ in items: fut.set_exception(e)
+                    for fut, _ in items: fut.set_exception(e)
             except Exception as e:
                 logger.error(f"Inference loop error: {e}")
                 await asyncio.sleep(0.1)
@@ -226,7 +225,6 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
             self._episode_slot_acquired.add(tag)
 
         obs_flat = self.assembler.assemble(battle)
-        policy_id = 0
 
         # Decide: Heuristic (Imitation) or Model (PPO)
         if self.cfg.learner.mode == "imitation":
@@ -234,7 +232,7 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
             action_idx = self.assembler.map_order_to_index(order, battle)
             logp, val = 0.0, 0.0
         else:
-            action_idx, logp, val = await self.infer_client.request(obs_flat, policy_id)
+            action_idx, logp, val = await self.infer_client.request(obs_flat)
 
         # Log trajectory
         traj = self._traj.setdefault(tag, {"observations": [], "act": [], "logp": [], "val": []})
@@ -270,9 +268,24 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
         rewards = np.zeros(T, dtype=np.float32)
         
         if self.cfg.reward.use_faint_reward:
-            # Custom reward shaping for fainted Pokémon
-            # [Logic omitted for brevity, identical to your implementation]
-            pass
+            b_start, b_end = self.assembler.offsets["pokemon_body"]
+            meta = self.assembler.meta
+            
+            dim_body  = meta["dim_pokemon_body"]
+            faint_idx = meta["faint_internal_idx"] # Pulled dynamically
+            
+            body_history = obs_stacked[:, b_start:b_end].reshape(T, 12, dim_body)
+        
+            is_fainted = body_history[:, :, faint_idx] > 0.5
+            
+            faints_self = is_fainted[:, :6].sum(axis=1)
+            faints_opp  = is_fainted[:, 6:].sum(axis=1)
+        
+            ds = np.diff(faints_self, prepend=faints_self[0])
+            do = np.diff(faints_opp,  prepend=faints_opp[0])
+
+            rewards = (np.maximum(0, ds) * float(self.cfg.reward.faint_self)) + \
+                  (np.maximum(0, do) * float(self.cfg.reward.faint_opp))
 
         rewards[-1] += terminal_reward
         dones = np.zeros(T, dtype=np.float32)
@@ -333,11 +346,21 @@ class RolloutWorker:
                 room="lobby"
             )
 
+        loop_idx = 0
         while True:
             await asyncio.sleep(REPAIR_INTERVAL_S)
+            loop_idx += 1
             for pA, pB in self.active_pairs:
                 asyncio.create_task(pA.run_reconciliation())
                 asyncio.create_task(pB.run_reconciliation())
+                
+            # Periodically re-assert the spawn target to fix drift/server resets
+            if loop_idx % 6 == 0:
+                for pA, pB in self.active_pairs:
+                    asyncio.create_task(pA.ps_client.send_message(
+                        f"/rlautospawn {pA.username}, {pB.username}, {self.cfg.env.battle_format}, {self.cfg.rollout.rooms_per_pair}",
+                        room="lobby"
+                    ))
 
     def _make_player(self, name: str, agent_id: int) -> RayBatchedPlayer:
         return RayBatchedPlayer(
@@ -365,7 +388,6 @@ class RolloutWorker:
             if hasattr(pB, "_battles"): total_lib_count += len(pB._battles)
         
         return {
-            "run_tag": self.run_tag,
             "active_battles_worker": total_active,
             "active_battles_library": total_lib_count, # Compare this to worker!
             "loop_lag_ms": round(lag, 2),

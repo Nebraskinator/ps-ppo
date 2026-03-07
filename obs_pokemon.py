@@ -9,7 +9,7 @@ representation.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Final
+from typing import Any, Dict, List, Optional, Final, Tuple
 
 import numpy as np
 from utils import get_id, normalize_name
@@ -65,7 +65,6 @@ def encode_pokemon_body_inplace(
     offsets: Dict[str, Tuple[int, int]], 
     vocab: Dict[str, Dict[str, int]], 
     vocab_lists: Dict[str, List[str]], 
-    type_map: Dict[str, int]
 ) -> None:
     """
     Encodes a Pokémon's full state directly into the pre-allocated calculation buffer.
@@ -134,7 +133,7 @@ def encode_pokemon_body_inplace(
     # 6. Boolean Flags & Status Counter (12-bin block)
     buffer[curr] = 1.0 if mon.active else 0.0
     buffer[curr + 1] = 1.0 if mon.fainted else 0.0
-    buffer[curr + 2] = 1.0 if getattr(mon, 'terastallized', False) else 0.0
+    buffer[curr + 2] = 1.0 if (getattr(mon, 'terastallized', False) or getattr(mon, 'is_terastallized', False)) else 0.0
     # Status counters (Sleep/Toxic) are clipped to 8 turns
     sc = int(np.clip(mon.status_counter, 0, 8))
     buffer[curr + 3 + sc] = 1.0
@@ -162,7 +161,7 @@ def encode_pokemon_body_inplace(
     v_vocab = vocab_lists["pokemon.effect"]
     if mon.effects:
         for effect in mon.effects:
-            v_idx = get_id(vocab, "pokemon.effect", normalize_name(str(effect)))
+            v_idx = get_id(vocab, "pokemon.effect", normalize_name(effect))
             buffer[curr + v_idx] = 1.0
     curr += (len(v_vocab) + 1)
     

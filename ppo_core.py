@@ -443,14 +443,14 @@ def ppo_update(
             logits, v_logits, _ = net(mb_obs)
 
             if mode == "imitation":
-                loss = nn.functional.cross_entropy(logits, mb_act, label_smoothing=0.1)
+                loss = nn.functional.cross_entropy(logits.float(), mb_act, label_smoothing=0.1)
                 pg_loss = loss; v_loss = ent_loss = approx_kl = clip_frac = torch.tensor(0.0, device=dev)
             elif mode == "warmup":
                 target_dist = twohot_targets(mb_ret, v_min=cfg["v_min"], v_max=cfg["v_max"], v_bins=cfg["v_bins"])
                 loss = dist_value_loss(v_logits, target_dist)
                 v_loss = loss; pg_loss = ent_loss = approx_kl = clip_frac = torch.tensor(0.0, device=dev)
             else:
-                logp, ent = masked_logprob_entropy(logits, mb_mask, mb_act)
+                logp, ent = masked_logprob_entropy(logits.float(), mb_mask, mb_act)
                 ratio = (logp - mb_logp_old).exp()
                 pg_loss = torch.max(-mb_adv * ratio, -mb_adv * ratio.clamp(1-cfg["clip_coef"], 1+cfg["clip_coef"])).mean()
                 
@@ -484,6 +484,12 @@ def ppo_update(
             break
 
     return PPOUpdateStats(
-        approx_kl=stats["kl"]/n_mb, clip_frac=stats["clip"]/n_mb, entropy=stats["ent"]/n_mb,
-        v_loss=stats["v"]/n_mb, pg_loss=stats["pg"]/n_mb, hp_loss=0.0, total_loss=stats["total"]/n_mb, n_mb=n_mb
+        approx_kl=stats["kl"]/max(n_mb, 1), 
+        clip_frac=stats["clip"]/max(n_mb, 1), 
+        entropy=stats["ent"]/max(n_mb, 1),
+        v_loss=stats["v"]/max(n_mb, 1), 
+        pg_loss=stats["pg"]/max(n_mb, 1), 
+        hp_loss=0.0, 
+        total_loss=stats["total"]/max(n_mb, 1), 
+        n_mb=n_mb
     )

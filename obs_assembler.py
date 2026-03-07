@@ -112,7 +112,7 @@ class ObservationAssembler:
             # Encode physical properties, stats, and health
             encode_pokemon_body_inplace(
                 mon, self.calc_buf, i, self.pokemon_scalar_dim, 
-                off, self.vocab_map, self.vocab_lists, self.vocab_map["pokemon.type"]
+                off, self.vocab_map, self.vocab_lists
             )
             
             # Encode categorical IDs (Species, Item, Ability)
@@ -184,11 +184,20 @@ class ObservationAssembler:
         if can_switch or avail_species:
             for i, mon in enumerate(self_team[:6]):
                 if not mon: continue
+                
+                # 1. Trusted Server Response
                 if mon.species in avail_species:
                     if is_reviving:
-                        if mon.fainted: mask[4 + i] = 1.0
+                        if not mon.fainted: mask[4 + i] = 1.0
                     elif not mon.fainted and not mon.active:
                         mask[4 + i] = 1.0
+                    continue
+                
+                # 2. Fallback for state desyncs (e.g., Zoroark Illusion)
+                if is_reviving:
+                    if not mon.fainted: mask[4 + i] = 1.0
+                elif force_switch:
+                    if not mon.active and mon.current_hp > 0: mask[4 + i] = 1.0
 
         # Safety: Ensure at least one action is always valid
         if not mask.any():
@@ -213,6 +222,7 @@ class ObservationAssembler:
             
             # Fallbacks
             if battle.available_moves: return battle.available_moves[0], {}
+            if battle.available_switches: return battle.available_switches[0], {}
             return "DEFAULT", {}
 
         # Switches
@@ -248,6 +258,17 @@ class ObservationAssembler:
             except ValueError: return 4
 
         return 0
+    
+    @staticmethod
+    def count_faints_from_obs(obs_step):
+        """
+        Optimized faint counting using NumPy boolean logic.
+        """
+        # Index 20 is the fainted flag. Using a direct slice is O(1) in memory view.
+        faints = obs_step["pokemon_body"][:, 20] > 0.5
+        
+        # .sum() on a boolean array is highly optimized in NumPy
+        return np.sum(faints[:6]), np.sum(faints[6:])
 
     @staticmethod
     def get_schema_metadata(vocab_lists: Dict[str, List[str]]=None) -> Dict[str, Any]:
@@ -283,18 +304,22 @@ class ObservationAssembler:
             "onehots_raw": (3, 19), "type_raw": (19, 19 + v_type)
         }
         dim_move_scalars = (19 + v_type) * 4
+        
+        weather_len = len(vocab_lists["global.weather"]) + 1 + 10
+        side_len = len(vocab_lists["global.side_condition"]) + 1
 
         return {
             "dim_pokemon_body": dim_pokemon_body,
             "dim_move_scalars": dim_move_scalars,
             "dim_transition_scalars": 10,
-            "dim_global_scalars": 3 + (len(vocab_lists["global.weather"]) + 11) + (v_type * 2),
+            "dim_global_scalars": 3 + weather_len + (side_len * 2),
             "feature_map": {"body": body_map, "move": move_map, "global": {"turn_int": 0, "remainder_raw": (1, None)}},
             "faint_internal_idx": 101 + 1,
             "vocab_pokemon": len(vocab_lists["pokemon.species"]) + 1,
             "vocab_item": len(vocab_lists["pokemon.item"]) + 1,
             "vocab_ability": len(vocab_lists["pokemon.ability"]) + 1,
             "vocab_move": len(vocab_lists["move.id"]) + 1,
+            "vocab_type": v_type,
             "action_dim": 14,
             "n_pokemon_slots": 12,
             "n_move_slots": 4,
