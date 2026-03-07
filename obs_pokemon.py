@@ -12,7 +12,7 @@ import logging
 from typing import Any, Dict, List, Optional, Final, Tuple
 
 import numpy as np
-from utils import get_id, normalize_name
+from utils import get_id
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -161,7 +161,7 @@ def encode_pokemon_body_inplace(
     v_vocab = vocab_lists["pokemon.effect"]
     if mon.effects:
         for effect in mon.effects:
-            v_idx = get_id(vocab, "pokemon.effect", normalize_name(effect))
+            v_idx = get_id(vocab, "pokemon.effect", effect)
             buffer[curr + v_idx] = 1.0
     curr += (len(v_vocab) + 1)
     

@@ -258,17 +258,6 @@ class ObservationAssembler:
             except ValueError: return 4
 
         return 0
-    
-    @staticmethod
-    def count_faints_from_obs(obs_step):
-        """
-        Optimized faint counting using NumPy boolean logic.
-        """
-        # Index 20 is the fainted flag. Using a direct slice is O(1) in memory view.
-        faints = obs_step["pokemon_body"][:, 20] > 0.5
-        
-        # .sum() on a boolean array is highly optimized in NumPy
-        return np.sum(faints[:6]), np.sum(faints[6:])
 
     @staticmethod
     def get_schema_metadata(vocab_lists: Dict[str, List[str]]=None) -> Dict[str, Any]:

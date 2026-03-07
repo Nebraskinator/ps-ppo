@@ -22,7 +22,7 @@ UNKNOWN_ENTITIES: CounterType[str] = Counter()
 _NORM_CACHE: Dict[Any, str] = {}
 
 
-def normalize_name(path: str, value: Any = None) -> Optional[str]:
+def normalize_name(value: Any) -> Optional[str]:
     """
     Normalizes a poke-env object or string into a consistent lowercase format.
     
@@ -30,8 +30,6 @@ def normalize_name(path: str, value: Any = None) -> Optional[str]:
     manipulation overhead during high-throughput rollout generation.
 
     Args:
-        path: The vocabulary path (e.g., "pokemon.species"), used mostly for API 
-              compatibility or debugging context.
         value: The raw object (string, Enum, or poke-env data class) to normalize.
 
     Returns:
@@ -87,7 +85,7 @@ def get_id(vocab_map: Dict[str, Dict[str, int]], path: str, value: Any) -> int:
     Returns:
         int: The 1-based vocabulary index, or 0 if not found/unknown.
     """
-    clean_val = normalize_name(path=path, value=value)
+    clean_val = normalize_name(value)
     
     if clean_val is None:
         return 0

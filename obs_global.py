@@ -1,5 +1,5 @@
 # obs_global.py
-from utils import normalize_name, two_hot_encode_inplace
+from utils import get_id, two_hot_encode_inplace
 
 # Fixed Global Size: 6 (scalars) + 10 (weather) + 10 (field) + 2*SideConditions
 # Side conditions depend on your vocab, but usually ~20 each. 
@@ -17,11 +17,11 @@ def encode_global_inplace(battle, buffer, offset_tuple, vocab_map, vocab_lists):
     
     # 2. Weather with 2-Hot Duration (10 bins for 0-8 turns + 1 for permanent)
     weather_list = vocab_lists.get("global.weather", [])
-    w_map = {name: i for i, name in enumerate(weather_list)}
 
     if battle.weather:
-        w_name = normalize_name(next(iter(battle.weather)))
-        w_idx = w_map.get(w_name)
+        weather_obj = next(iter(battle.weather))
+        # get_id handles normalization and returns 1-based index
+        w_idx = get_id(vocab_map, "global.weather", weather_obj)
         if w_idx is not None:
             # Mark the type
             buffer[curr + w_idx] = 1.0
@@ -34,13 +34,16 @@ def encode_global_inplace(battle, buffer, offset_tuple, vocab_map, vocab_lists):
     # Note: No volatiles here anymore! They moved to obs_pokemon.
     curr += (len(weather_list) + 11)
     side_keys = vocab_lists.get("global.side_condition", [])
-    s_map = {name: i for i, name in enumerate(side_keys)}
     
-    for side, conditions in [(0, battle.side_conditions), (1, battle.opponent_side_conditions)]:
-        side_offset = curr + (side * len(side_keys))
+    sides = [
+        (0, getattr(battle, 'side_conditions', {})),
+        (1, getattr(battle, 'opponent_side_conditions', {}))
+    ]
+    
+    for side_idx, conditions in sides:
+        side_offset = curr + (side_idx * len(side_keys) + 1)
         for cond_enum, val in conditions.items():
-            name = normalize_name(cond_enum)
-            idx = s_map.get(name)
+            idx = get_id(vocab_map, "global.side_condition", cond_enum)
             if idx is not None:
                 # Stackable conditions (Spikes) get binned/scaled
                 buffer[side_offset + idx] = min(1.0, float(val) / 3.0)

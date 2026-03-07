@@ -133,8 +133,8 @@ class LearnerActor:
         lr_v = base_lr * self.cfg.lr_v_mult
 
         param_groups = [
-            {"params": t_decay, "lr": lr_back, "weight_decay": wd_val, "name": "trunk_wd"},
-            {"params": t_no_decay, "lr": lr_back, "weight_decay": 0.0, "name": "trunk_stable"},
+            {"params": t_decay, "lr": lr_back, "weight_decay": wd_val, "name": "transformer_wd"},
+            {"params": t_no_decay, "lr": lr_back, "weight_decay": 0.0, "name": "transformer_stable"},
             {"params": s_decay, "lr": lr_back, "weight_decay": wd_val, "name": "subnets_wd"},
             {"params": s_no_decay, "lr": lr_back, "weight_decay": 0.0, "name": "subnets_stable"},
             {"params": pi_decay, "lr": lr_pi, "weight_decay": wd_val, "name": "pi_wd"},
@@ -358,7 +358,10 @@ class LearnerActor:
             "scheduler": self.sched.state_dict() if self.sched else None,
             "update_idx": self.update_idx,
             "total_steps": self.total_steps,
-            "run_cfg": self.run_cfg.as_dict()
+            "run_cfg": self.run_cfg.as_dict(),
+            "total_episodes": self.total_episodes,
+            "torch_rng": torch.get_rng_state(),
+            "numpy_rng": np.random.get_state(),
         }
         torch.save(payload, path + ".tmp")
         os.replace(path + ".tmp", path)

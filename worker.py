@@ -392,3 +392,9 @@ class RolloutWorker:
             "active_battles_library": total_lib_count, # Compare this to worker!
             "loop_lag_ms": round(lag, 2),
         }
+    
+    def get_debug_stats(self):
+        # Active battles = size of our tracking dict
+        n_active = len(self._battle_starts)
+            
+        return n_active

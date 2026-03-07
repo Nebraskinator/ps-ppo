@@ -100,7 +100,7 @@ def masked_sample(
      
     if greedy:
         a = torch.argmax(ml_pure, dim=-1)
-        return a, dist_pure.log_prob(a), torch.zeros_like(a)
+        return a, dist_pure.log_prob(a), torch.zeros_like(a, dtype=torch.float32)
     
     if 0.0 < top_p < 1.0:
         probs = torch.softmax(ml_explore, dim=-1)

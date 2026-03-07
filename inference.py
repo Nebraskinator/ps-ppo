@@ -108,7 +108,7 @@ class InferenceActor:
         self.resume_from_disk()
 
     @torch.no_grad()
-    def infer_batch(self, policy_ids_np: np.ndarray, obs_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def infer_batch(self, obs_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Executes a batch forward pass for a single policy, ignoring legacy policy IDs.
         """
