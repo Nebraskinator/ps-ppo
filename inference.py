@@ -69,20 +69,19 @@ class InferenceStats:
 
 @ray.remote
 class WeightStore:
-    """
-    A centralized Ray actor that serves as the latest 'truth' for model weights.
-    Workers pull from here to synchronize their local GPU models.
-    """
     def __init__(self):
-        self.weights: Optional[dict] = None
-        self.version: int = -1
+        self.weights = None
+        self.version = -1
 
-    def update(self, weights: dict, version: int):
+    def update(self, weights, version):
         self.weights = weights
         self.version = version
 
-    def get_state(self) -> Tuple[Optional[dict], int]:
-        return self.weights, self.version
+    def get_version(self):
+        return self.version
+
+    def get_weights(self):
+        return self.weights
 
 
 class InferenceActor:
@@ -146,14 +145,14 @@ class InferenceActor:
     def _sync_weights(self):
         """Pulls updated weights from the WeightStore if a new version is available."""
         # Use a lightweight version check before pulling the heavy state_dict
-        latest_v = ray.get(self.weight_store.get_state.remote())[1]
+        latest_v = ray.get(self.weight_store.get_version.remote())
         
         if latest_v > self.current_version:
-            weights, version = ray.get(self.weight_store.get_state.remote())
+            weights = ray.get(self.weight_store.get_weights.remote())
             if weights:
                 self.net.load_state_dict(weights, strict=True)
-                self.current_version = version
-                logger.info(f"InferenceActor synced to version {version}")
+                self.current_version = latest_v
+                logger.info(f"InferenceActor synced to version {latest_v}")
 
     def resume_from_disk(self):
         """Initializes the actor with the latest weights found in the checkpoint directory."""

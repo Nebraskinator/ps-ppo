@@ -188,14 +188,16 @@ class ObservationAssembler:
                 # 1. Trusted Server Response
                 if mon.species in avail_species:
                     if is_reviving:
-                        if not mon.fainted: mask[4 + i] = 1.0
+                        if mon.fainted: # ONLY allow fainted mons to be picked
+                            mask[4 + i] = 1.0
                     elif not mon.fainted and not mon.active:
                         mask[4 + i] = 1.0
                     continue
                 
                 # 2. Fallback for state desyncs (e.g., Zoroark Illusion)
                 if is_reviving:
-                    if not mon.fainted: mask[4 + i] = 1.0
+                    if mon.fainted: # ONLY allow fainted mons to be picked
+                        mask[4 + i] = 1.0
                 elif force_switch:
                     if not mon.active and mon.current_hp > 0: mask[4 + i] = 1.0
 
@@ -315,3 +317,36 @@ class ObservationAssembler:
             "n_ability_slots": 4,
             "n_transition_moves": 2,
         }
+    
+    def debug_observation_integrity(self, obs_vector: np.ndarray):
+        """Prints a report of which observation segments are currently all zeros or problematic."""
+        print("\n" + "="*50)
+        print(f"{'FEATURE NAME':<25} | {'STATUS':<10} | {'NON-ZERO'}")
+        print("-"*50)
+        
+        # Use the internal offsets dictionary defined in __init__
+        for feature_name, (start, end) in self.offsets.items():
+            slice_data = obs_vector[start:end]
+            nonzero_count = np.count_nonzero(slice_data)
+            
+            # Logic check: Global scalars and Action Mask should NEVER be all zero
+            # Pokemon slots might be zero if the team is small (e.g. 1 mon left)
+            status = "✅ OK" if nonzero_count > 0 else "⚠️ EMPTY"
+            
+            if feature_name == "action_mask" and nonzero_count == 0:
+                status = "🚨 CRITICAL (NO VALID ACTIONS)"
+            
+            print(f"{feature_name:<25} | {status:<10} | {nonzero_count}/{len(slice_data)}")
+
+            # Deep dive into stats for non-empty blocks
+            if nonzero_count > 0:
+                max_val = np.max(slice_data)
+                mean_val = np.mean(slice_data)
+                # Check for suspiciously high values (unnormalized stats)
+                if max_val > 1000:
+                    print(f"   🚩 WARNING: High value detected ({max_val:.2f}). Check normalization!")
+
+        # Check for NaNs - these will break neural network backprop
+        if np.isnan(obs_vector).any():
+            print("\n🚨 CRITICAL: NaN values detected in observation vector!")
+        print("="*50 + "\n")

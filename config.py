@@ -17,10 +17,6 @@ from pathlib import Path
 # Setup logging for configuration errors
 logger = logging.getLogger(__name__)
 
-# Type Aliases
-TrainingMode = Literal["imitation", "warmup", "ppo"]
-
-
 @dataclass(frozen=True)
 class ObsConfig:
     """Configuration for observation parsing and tokenization schema."""
@@ -123,7 +119,7 @@ class InferenceConfig:
 class LearnerConfig:
     """Core PPO and Hyperparameter settings."""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    mode: TrainingMode = "ppo"
+    mode: str = "imitation"
     
     # Reinforcement Learning Math
     gamma: float = 0.9999

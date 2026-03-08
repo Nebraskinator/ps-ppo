@@ -111,12 +111,26 @@ async def main():
     await asyncio.sleep(20)
     
     # Launch asynchronous rollout tasks
-    _ = [w.run.remote() for w in workers]
+    run_refs = [w.run.remote() for w in workers]
 
     # 5. Monitoring Loop
     logger.info("Training started. Entering telemetry loop.")
     while True:
         try:
+            finished, _ = ray.wait(run_refs, num_returns=len(run_refs), timeout=0)
+            if finished:
+                for ref in finished:
+                    try:
+                        ray.get(ref) # This will raise the hidden exception
+                    except Exception as e:
+                        logger.critical(f"FATAL: A RolloutWorker crashed in run(): {e}")
+                        import traceback
+                        traceback.print_exception(type(e), e, e.__traceback__)
+                
+                # Nuke the cluster so you don't stare at 0s
+                logger.critical("Shutting down cluster due to worker crash.")
+                ray.shutdown()
+                sys.exit(1)
             # Gather telemetry from all actors in parallel
             istats_ref = infer.get_stats.remote()
             lstats_ref = learner.get_stats.remote()

@@ -42,6 +42,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # MONKEY PATCHES & SYSTEM FIXES
 # ---------------------------------------------------------------------------
+_original_handle_message = poke_env.ps_client.PSClient._handle_message
+
+async def _loud_handle_message(self, message):
+    try:
+        await _original_handle_message(self, message)
+    except Exception as e:
+        print(f"\n[CRITICAL POKE-ENV CRASH] Error handling message: {message[:100]}...", flush=True)
+        import traceback
+        traceback.print_exc()
+        raise e
+
+poke_env.ps_client.PSClient._handle_message = _loud_handle_message
 
 def _apply_patches():
     """Applies necessary patches to poke_env and asyncio for stability."""
@@ -71,6 +83,44 @@ def _apply_patches():
 
 _apply_patches()
 
+def make_server_conf(host: str, port: int) -> ServerConfiguration:
+    ws_url = f"ws://{host}:{port}/showdown/websocket"
+    http_action = f"http://{host}:{port}/action.php?"
+    return ServerConfiguration(ws_url, http_action)
+
+def battle_tag_for(battle) -> str:
+    """Prevents dictionary key collisions if the server omits a tag."""
+    tag = getattr(battle, "battle_tag", None)
+    if not tag: tag = f"pyid_{id(battle)}"
+    return str(tag)
+
+def mk_name(run_tag: str, p: int, side: str) -> str:
+    """Creates strictly alphanumeric usernames for Showdown."""
+    return f"p{run_tag}{p:03d}{side}"
+
+async def wait_for_login(player: RayBatchedPlayer, timeout_s: float = 30.0) -> None:
+    c = getattr(player, "ps_client", None)
+    if c is None: raise RuntimeError(f"{player.username} has no ps_client")
+    fn = getattr(c, "wait_for_login", None)
+    if not callable(fn): raise RuntimeError(f"{player.username}.ps_client has no wait_for_login()")
+    await asyncio.wait_for(fn(), timeout=timeout_s)
+
+async def safe_send(player: RayBatchedPlayer, message: str, room: str, *, retries: int = 8) -> None:
+    """Retries sending messages to handle brief websocket desyncs."""
+    await wait_for_login(player)
+    last_err = None
+    for i in range(retries):
+        try:
+            await player.ps_client.send_message(message, room=room)
+            return
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(0.05 * (i + 1))
+    raise RuntimeError(f"[safe_send] failed: {message!r} ({last_err!r})")
+
+async def join_lobby(player: RayBatchedPlayer) -> None:
+    await safe_send(player, "/join lobby", room="")
+    
 # ---------------------------------------------------------------------------
 # CLIENT CLASSES
 # ---------------------------------------------------------------------------
@@ -214,7 +264,7 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
         self._last_act_time: Dict[str, float] = {}
 
     async def choose_move(self, battle):
-        tag = str(battle.battle_tag)
+        tag = battle_tag_for(battle)
         now = time.time()
         self._last_act_time[tag] = now
         self._battle_starts.setdefault(tag, now)
@@ -247,7 +297,7 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
         return self.create_order(action_obj, **kwargs)
 
     def _battle_finished_callback(self, battle):
-        tag = str(battle.battle_tag)
+        tag = battle_tag_for(battle)
         if tag in self._traj:
             self._process_experience(battle, tag)
         self._cleanup_local_battle(tag)
@@ -303,11 +353,50 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
         self._traj.pop(tag, None)
         if tag in self._episode_slot_acquired:
             self._episode_slot_acquired.remove(tag)
+        
+        # ADD THIS LINE: Manually clear from poke-env internal dictionary
+        if hasattr(self, "_battles"):
+            self._battles.pop(tag, None)
 
     async def run_reconciliation(self):
         """Issues a server-side query to find orphaned rooms."""
         try: await self.ps_client.send_message("/rlactive", room="")
         except Exception: pass
+    
+        
+    def get_debug_stats(self):
+        # Active battles = size of our tracking dict
+        n_active = len(self._battle_starts)
+            
+        return n_active
+    
+    def _handle_query(self, query_type: str, data: Any) -> None:
+        """Handles server-side room recovery broadcast for missing rooms."""
+        super()._handle_query(query_type, data)
+        
+        if query_type == "rlactive":
+            if not data or isinstance(data, list):
+                server_ids = set()
+            else:
+                server_ids = set(str(data).split(","))
+            
+            server_ids.discard("")
+            local_ids = set(self._battle_starts.keys())
+            
+            # 1. GHOSTS: Server has it, we don't. -> JOIN (Fixes missed Init)
+            ghosts = list(server_ids - local_ids)
+            for bid in ghosts:
+                asyncio.create_task(self.ps_client.send_message(f"/join {bid}", room=""))
+            
+            # 2. STALLS: We have it, but haven't acted in > 60s. -> RESCUE
+            now = time.time()
+            stalls = [bid for bid in local_ids if bid in server_ids and (now - self._last_act_time.get(bid, 0)) > 60.0]
+            
+            for bid in stalls:
+                tag = bid.split(":", 1)[1] if ":" in bid else bid
+                self._cleanup_local_battle(tag)
+                asyncio.create_task(self.ps_client.send_message(f"/rlrescue {bid}", room=""))
+                asyncio.create_task(self.ps_client.send_message(f"/join {bid}", room=""))
 
 # ---------------------------------------------------------------------------
 # ROLLOUT WORKER (RAY ACTOR)
@@ -324,43 +413,51 @@ class RolloutWorker:
         self.cfg = cfg
         self.infer_client = WorkerInferenceClient(inference_actor, cfg)
         self.learn_client = WorkerLearnerClient(learner_actor, cfg)
-        self.server_conf = ServerConfiguration("localhost", server_port)
+        self.server_conf = make_server_conf("localhost", server_port)
         self.pairs_count = pairs
         self.active_pairs: List[Tuple[RayBatchedPlayer, RayBatchedPlayer]] = []
+        self.run_tag = secrets.token_hex(3)
 
     async def run(self):
         """Initializes all players and enters the main maintenance loop."""
-        for i in range(self.pairs_count):
-            tag = secrets.token_hex(2)
-            pA = self._make_player(f"p_{tag}_{i}a", 2*i)
-            pB = self._make_player(f"p_{tag}_{i}b", 2*i + 1)
-            self.active_pairs.append((pA, pB))
-
-        # Login and start spawning
-        players = [p for pair in self.active_pairs for p in pair]
-        await asyncio.gather(*[p.ps_client.wait_for_login() for p in players])
-        
-        for pA, pB in self.active_pairs:
-            await pA.ps_client.send_message(
-                f"/rlautospawn {pA.username}, {pB.username}, {self.cfg.env.battle_format}, {self.cfg.rollout.rooms_per_pair}",
-                room="lobby"
-            )
-
-        loop_idx = 0
-        while True:
-            await asyncio.sleep(REPAIR_INTERVAL_S)
-            loop_idx += 1
-            for pA, pB in self.active_pairs:
-                asyncio.create_task(pA.run_reconciliation())
-                asyncio.create_task(pB.run_reconciliation())
-                
-            # Periodically re-assert the spawn target to fix drift/server resets
-            if loop_idx % 6 == 0:
+        try:
+            for i in range(self.pairs_count):
+                a_name = mk_name(self.run_tag, i, "a")
+                b_name = mk_name(self.run_tag, i, "b")
+                pA = self._make_player(a_name, 2*i)
+                pB = self._make_player(b_name, 2*i + 1)
+                self.active_pairs.append((pA, pB))
+    
+            # Login and start spawning (Exact original sequence)
+            players = [p for pair in self.active_pairs for p in pair]
+            await asyncio.gather(*[wait_for_login(p) for p in players])
+            await asyncio.gather(*[join_lobby(p) for p in players])
+            
+            await asyncio.gather(*[
+                safe_send(pA, f"/rlautospawn {pA.username}, {pB.username}, {self.cfg.env.battle_format}, {self.cfg.rollout.rooms_per_pair}", room="lobby")
+                for (pA, pB) in self.active_pairs
+            ])
+            loop_idx = 0
+            while True:
+                await asyncio.sleep(REPAIR_INTERVAL_S)
+                loop_idx += 1
                 for pA, pB in self.active_pairs:
-                    asyncio.create_task(pA.ps_client.send_message(
-                        f"/rlautospawn {pA.username}, {pB.username}, {self.cfg.env.battle_format}, {self.cfg.rollout.rooms_per_pair}",
-                        room="lobby"
-                    ))
+                    asyncio.create_task(pA.run_reconciliation())
+                    asyncio.create_task(pB.run_reconciliation())
+                    
+                # Periodically re-assert the spawn target to fix drift
+                if loop_idx % 6 == 0:
+                    for pA, pB in self.active_pairs:
+                        asyncio.create_task(
+                            safe_send(pA, f"/rlautospawn {pA.username}, {pB.username}, {self.cfg.env.battle_format}, {self.cfg.rollout.rooms_per_pair}", room="lobby")
+                        )
+                        
+        except Exception as e:
+            # Safely get the websocket URL, defaulting to "Unknown Server" if missing
+            url = getattr(self.server_conf, "websocket_url", "Unknown Server")
+            print(f"\n[CRITICAL WORKER CRASH] {url} failed in run(): {e}", flush=True)
+            import traceback
+            traceback.print_exc()
 
     def _make_player(self, name: str, agent_id: int) -> RayBatchedPlayer:
         return RayBatchedPlayer(
@@ -369,7 +466,11 @@ class RolloutWorker:
             account_configuration=AccountConfiguration(name, None),
             server_configuration=self.server_conf,
             max_concurrent_battles=self.cfg.rollout.rooms_per_pair,
-            start_listening=True
+            battle_format=self.cfg.env.battle_format, 
+            open_timeout=self.cfg.rollout.open_timeout, # Restored timeout
+            ping_interval=None,                       
+            ping_timeout=None,                        
+            start_listening=True, log_level=40
         )
     
     async def heartbeat(self):
@@ -392,9 +493,3 @@ class RolloutWorker:
             "active_battles_library": total_lib_count, # Compare this to worker!
             "loop_lag_ms": round(lag, 2),
         }
-    
-    def get_debug_stats(self):
-        # Active battles = size of our tracking dict
-        n_active = len(self._battle_starts)
-            
-        return n_active
