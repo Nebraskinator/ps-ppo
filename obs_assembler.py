@@ -320,9 +320,6 @@ class ObservationAssembler:
     
     def debug_observation_integrity(self, obs_vector: np.ndarray):
         """Prints a report of which observation segments are currently all zeros or problematic."""
-        print("\n" + "="*50)
-        print(f"{'FEATURE NAME':<25} | {'STATUS':<10} | {'NON-ZERO'}")
-        print("-"*50)
         
         # Use the internal offsets dictionary defined in __init__
         for feature_name, (start, end) in self.offsets.items():
@@ -341,7 +338,6 @@ class ObservationAssembler:
             # Deep dive into stats for non-empty blocks
             if nonzero_count > 0:
                 max_val = np.max(slice_data)
-                mean_val = np.mean(slice_data)
                 # Check for suspiciously high values (unnormalized stats)
                 if max_val > 1000:
                     print(f"   🚩 WARNING: High value detected ({max_val:.2f}). Check normalization!")
@@ -349,4 +345,3 @@ class ObservationAssembler:
         # Check for NaNs - these will break neural network backprop
         if np.isnan(obs_vector).any():
             print("\n🚨 CRITICAL: NaN values detected in observation vector!")
-        print("="*50 + "\n")

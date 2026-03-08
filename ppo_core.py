@@ -342,7 +342,6 @@ class PPOUpdateStats:
     entropy: float
     v_loss: float
     pg_loss: float
-    hp_loss: float
     total_loss: float
     n_mb: int
 
