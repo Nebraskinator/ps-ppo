@@ -107,11 +107,14 @@ async def main():
 
     # 4. Staggered Startup
     # Allow core actors to initialize and load checkpoints before starting battles
-    logger.info("Awaiting actor warm-up (20s)...")
-    await asyncio.sleep(20)
+    logger.info("Staggering initialization of actors...")
+    await asyncio.sleep(2)
     
     # Launch asynchronous rollout tasks
-    run_refs = [w.run.remote() for w in workers]
+    run_refs = []
+    for w in workers:
+        run_refs.append(w.run.remote())
+        time.sleep(4) # required to prevent overloading communication channels
 
     # 5. Monitoring Loop
     logger.info("Training started. Entering telemetry loop.")

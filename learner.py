@@ -23,7 +23,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from config import RunConfig
+import ppo_core
 from ppo_core import AsyncEpisodeDataset, gae_from_episode, ppo_update
+
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -72,6 +74,8 @@ class LearnerActor:
         self._task = loop.create_task(self._loop())
         self._task.add_done_callback(self._on_loop_done)
         self._startup_task = loop.create_task(self._maybe_resume_latest())
+        
+        self.ep_counter = 0
 
     def _init_optimizer(self):
         """
@@ -165,6 +169,18 @@ class LearnerActor:
             return 1.0 / ((8 * progress + 1) ** 1.5)
 
         self.sched = optim.lr_scheduler.LambdaLR(self.opt, lr_lambda=lr_lambda)
+        
+    def _enable_compiled_flex_attention(self):
+        """
+        Compile flex_attention only inside the learner actor process.
+        Safe because Ray actors are separate Python processes.
+        """
+        if getattr(ppo_core, "_learner_flex_compiled", False):
+            return
+
+        ppo_core.flex_attention = torch.compile(ppo_core.flex_attention)
+        ppo_core._learner_flex_compiled = True
+        logger.info("LearnerActor enabled compiled flex_attention")
 
     async def _loop(self):
         """
@@ -191,7 +207,7 @@ class LearnerActor:
             done_all = torch.from_numpy(done_cat).float()
 
             # Vectorized GAE Calculation
-            adv_chunks, ret_chunks = [], []
+            adv_chunks, ret_chunks, id_chunks = [], [], []
             curr = 0
             for length in lengths.tolist():
                 end = curr + int(length)
@@ -201,11 +217,16 @@ class LearnerActor:
                 )
                 adv_chunks.append(adv)
                 ret_chunks.append(ret)
+                # Generate matching Episode IDs for this chunk
+                id_chunks.append(torch.full((int(length),), self.ep_counter, dtype=torch.long))
+                
                 curr = end
+                self.ep_counter += 1 # Increment unique global episode ID
 
             self.dataset.add_steps(
                 obs_all, act_all, torch.from_numpy(logp_cat), val_all,
-                torch.cat(adv_chunks), torch.cat(ret_chunks), torch.zeros(len(act_all))
+                torch.cat(adv_chunks), torch.cat(ret_chunks), torch.zeros(len(act_all)),
+                torch.cat(id_chunks)
             )
             
             self.total_episodes += len(lengths)
@@ -276,7 +297,7 @@ class LearnerActor:
         """Executes a PPO update and synchronizes weights with Inference."""
         try:
             # 1. Prepare training data
-            obs_u, act_u, logp_u, val_u, adv_u, ret_u, next_hp_u = self.dataset.swap_out_tensor_cache()
+            obs_u, act_u, logp_u, val_u, adv_u, ret_u, next_hp_u, ep_ids_u = self.dataset.swap_out_tensor_cache()
             
             diag = {}
             diag.update(self._stats_1d(adv_u, "adv_pre"))
@@ -292,7 +313,7 @@ class LearnerActor:
             diag["adv_norm_std"]  = float(adv_u.std(unbiased=False))
             
             train_ds = AsyncEpisodeDataset(self.run_cfg.env.act_dim, obs_u.device)
-            train_ds.add_steps(obs_u, act_u, logp_u, val_u, adv_u, ret_u, next_hp_u)
+            train_ds.add_steps(obs_u, act_u, logp_u, val_u, adv_u, ret_u, next_hp_u, ep_ids_u)
 
             # 3. PPO Update Step
             stats = ppo_update(
@@ -375,7 +396,9 @@ class LearnerActor:
     def _init_if_needed(self):
         """Lazy initialization of the network and optimizer."""
         if self.net is None:
+            self._enable_compiled_flex_attention()
             self.net = self.run_cfg.make_model().to(self.cfg.device).train()
+            self.net.enable_bf16_recurrent_path()
             self._init_optimizer()
             
     def _latest_ckpt_path(self) -> Optional[str]:
@@ -421,12 +444,22 @@ class LearnerActor:
         self._init_if_needed()
 
         assert self.net is not None and self.opt is not None
-        self.net.load_state_dict(ckpt["model"])
         
         ckpt_mode = ckpt.get("run_cfg", {}).get("learner", {}).get("mode", "unknown")
         current_mode = self.cfg.mode
         
         should_reset_opt = (current_mode != ckpt_mode)
+        model_weights = {k: v for k, v in ckpt["model"].items() if "attn_mask" not in k}
+        
+        # If transitioning from imitation, filter out the dead memory weights
+        # strict=False allows the fresh memory weights to persist
+        #if should_reset_opt and current_mode == "ppo":
+        #    print(f"[learner] 🧹 Scrubbing dead memory weights from {ckpt_mode} checkpoint.")
+        #    model_weights = {k: v for k, v in model_weights.items() if "mem" not in k}
+        #    self.net.load_state_dict(model_weights, strict=False)
+        #else:
+            # FIX: We intentionally scrubbed attn_mask, so strict must be False
+        self.net.load_state_dict(model_weights, strict=False)
 
         if should_reset_opt:
             print(f"[learner] 🛑 PHASE CHANGE DETECTED ({ckpt_mode} -> {current_mode}).")

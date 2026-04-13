@@ -74,7 +74,7 @@ class ObservationAssembler:
         for name, _, size in self.layout:
             self.offsets[name] = (curr, curr + size)
             curr += size
-        
+        self.meta["offsets"] = self.offsets
         self.total_dim = curr
         # Using float16 for memory efficiency during rollout
         self.calc_buf = np.zeros(self.total_dim, dtype=np.float16)
@@ -318,30 +318,43 @@ class ObservationAssembler:
             "n_transition_moves": 2,
         }
     
-    def debug_observation_integrity(self, obs_vector: np.ndarray):
-        """Prints a report of which observation segments are currently all zeros or problematic."""
+    def translate_relative_index(self, block_name: str, relative_idx: int) -> str:
+        """Translates a raw block index into a human-readable feature name."""
+        meta = self.meta
         
-        # Use the internal offsets dictionary defined in __init__
-        for feature_name, (start, end) in self.offsets.items():
-            slice_data = obs_vector[start:end]
-            nonzero_count = np.count_nonzero(slice_data)
+        try:
+            if block_name == "pokemon_body":
+                single_dim = self.pokemon_scalar_dim
+                slot = relative_idx // single_dim
+                idx_in_mon = relative_idx % single_dim
+                
+                for k, v in meta["feature_map"]["body"].items():
+                    if isinstance(v, tuple) and v[0] <= idx_in_mon < v[1]:
+                        return f"P{slot//6 + 1}_Mon{slot%6}.{k}[{idx_in_mon - v[0]}]"
+                    elif v == idx_in_mon:
+                        return f"P{slot//6 + 1}_Mon{slot%6}.{k}"
+                        
+            elif block_name == "move_scalars":
+                # dim_move_scalars is the total size for all 4 moves of ONE pokemon
+                single_move_dim = meta["dim_move_scalars"] // 4
+                slot = relative_idx // meta["dim_move_scalars"]
+                idx_in_mon = relative_idx % meta["dim_move_scalars"]
+                move_num = idx_in_mon // single_move_dim
+                idx_in_move = idx_in_mon % single_move_dim
+                
+                for k, v in meta["feature_map"]["move"].items():
+                    if isinstance(v, tuple) and v[0] <= idx_in_move < v[1]:
+                        return f"P{slot//6 + 1}_Mon{slot%6}.Move{move_num}.{k}[{idx_in_move - v[0]}]"
+                    elif v == idx_in_move:
+                        return f"P{slot//6 + 1}_Mon{slot%6}.Move{move_num}.{k}"
+                        
+            elif block_name == "global_scalars":
+                if relative_idx == 0: return "turn_int"
+                if relative_idx == 1: return "p1_tera_flag"
+                if relative_idx == 2: return "p2_tera_flag"
+                return f"weather_or_side_condition[{relative_idx}]"
+                
+        except Exception:
+            pass
             
-            # Logic check: Global scalars and Action Mask should NEVER be all zero
-            # Pokemon slots might be zero if the team is small (e.g. 1 mon left)
-            status = "✅ OK" if nonzero_count > 0 else "⚠️ EMPTY"
-            
-            if feature_name == "action_mask" and nonzero_count == 0:
-                status = "🚨 CRITICAL (NO VALID ACTIONS)"
-            
-            print(f"{feature_name:<25} | {status:<10} | {nonzero_count}/{len(slice_data)}")
-
-            # Deep dive into stats for non-empty blocks
-            if nonzero_count > 0:
-                max_val = np.max(slice_data)
-                # Check for suspiciously high values (unnormalized stats)
-                if max_val > 1000:
-                    print(f"   🚩 WARNING: High value detected ({max_val:.2f}). Check normalization!")
-
-        # Check for NaNs - these will break neural network backprop
-        if np.isnan(obs_vector).any():
-            print("\n🚨 CRITICAL: NaN values detected in observation vector!")
+        return f"Unknown[{relative_idx}]"

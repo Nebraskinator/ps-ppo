@@ -29,6 +29,7 @@ class ObsConfig:
 @dataclass(frozen=True)
 class ModelConfig:
     """Parameters for the PokeTransformer/PokeNet architecture."""
+    
     # Dedicated Embedding Sizes
     emb_dims: Dict[str, int] = field(default_factory=lambda: {
         "pokemon": 96,
@@ -42,16 +43,16 @@ class ModelConfig:
     out_dims: Dict[str, int] = field(default_factory=lambda: {
         "move_vec": 128,
         "ability_vec": 128,
-        "pokemon_vec": 1024,
-        "global_vec": 128,
-        "transition_vec": 128,
+        "pokemon_vec": 1280,
+        "global_vec": 256,
+        "transition_vec": 256,
     })
     
     # Universal Embedding Bank Sizes
     bank_dims: Dict[str, int] = field(default_factory=lambda: {
-        "val_100": 64,  # HP, Level, Acc, PP
-        "stat": 64,     # Base Stats, Weight, Height
-        "power": 64,    # Move Power
+        "val_100": 128,  # HP, Level, Acc, PP
+        "stat": 128,     # Base Stats, Weight, Height
+        "power": 128,    # Move Power
     })
     
     # Vocabulary Safety Caps
@@ -62,8 +63,8 @@ class ModelConfig:
     })
     
     dropout: float = 0.0
-    n_layers: int = 2
-    n_heads: int = 8
+    n_layers: int = 3
+    n_heads: int = 10
     ff_expansion: float = 4.0
 
 
@@ -93,8 +94,8 @@ class RolloutConfig:
     learn_min_episodes: int = 32
     learn_max_episodes: int = 256
     learn_wait_ms: float = 5.0
-    learn_max_pending_episodes: int = 4096
-    learn_max_pending_batches: int = 4096
+    learn_max_pending_episodes: int = 15000
+    learn_max_pending_batches: int = 15000
 
     def worker_kwargs(self) -> Dict[str, Any]:
         """Returns a dictionary suitable for RolloutWorker initialization."""
@@ -119,10 +120,10 @@ class InferenceConfig:
 class LearnerConfig:
     """Core PPO and Hyperparameter settings."""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    mode: str = "imitation"
+    mode: str = "ppo"
     
     # Reinforcement Learning Math
-    gamma: float = 0.9999
+    gamma: float = 0.999
     gae_lambda: float = 0.75
     
     # Distributional Value (Two-Hot Encoding)
@@ -133,14 +134,14 @@ class LearnerConfig:
     
     # Schedules
     temp_start: float = 1.0
-    temp_end: float = 0.9
+    temp_end: float = 1.0
     temp_total_steps: int = 500_000
     
     # Optimizer settings
-    lr: float = 1e-4
+    lr: float = 2e-4
     lr_warmup_steps: int = 1_000
-    lr_hold_steps: int = 20_000
-    lr_total_steps: int = 500_000
+    lr_hold_steps: int = 50_000
+    lr_total_steps: int = 150_000
     weight_decay: float = 1e-2
     
     # Layer-specific LR multipliers (initialized in __post_init__)
@@ -149,10 +150,11 @@ class LearnerConfig:
     lr_v_mult: float = field(init=False)
     
     # PPO Specifics
-    update_epochs: int = 3
+    update_epochs: int = 6
     minibatch_size: int = 4096
-    clip_coef: float = 0.2
-    ent_coef: float = 0.02
+    batch_seq_len: int = 256
+    clip_coef: float = 0.15
+    ent_coef: float = 0.04
     vf_coef: float = 0.5
     clip_vloss: bool = False
     max_grad_norm: float = 0.5
@@ -175,13 +177,21 @@ class LearnerConfig:
         multipliers = {
             "imitation": (1.0, 1.0, 0.0),
             "warmup": (0.0, 0.0, 1.0),
-            "ppo": (1.0, 1.0, 1.0),
+            "ppo": (1.0, 1.0, 2.0),
         }
         backbone, pi, v = multipliers.get(self.mode, (1.0, 1.0, 1.0))
         
         object.__setattr__(self, "lr_backbone_mult", backbone)
         object.__setattr__(self, "lr_pi_mult", pi)
         object.__setattr__(self, "lr_v_mult", v)
+        
+        if self.batch_seq_len <= 0:
+            raise ValueError("batch_seq_len must be > 0")
+        if self.minibatch_size % self.batch_seq_len != 0:
+            raise ValueError(
+                f"minibatch_size ({self.minibatch_size}) must be divisible by "
+                f"batch_seq_len ({self.batch_seq_len})"
+            )
 
     def get_temp(self, global_step: int) -> float:
         """Calculates linear annealing of the action temperature."""
@@ -192,8 +202,11 @@ class LearnerConfig:
 
     def ppo_kwargs(self) -> Dict[str, Any]:
         """Extracts PPO-specific hyperparameters for the optimizer."""
-        keys = ["update_epochs", "minibatch_size", "clip_coef", "ent_coef", 
-                "vf_coef", "clip_vloss", "max_grad_norm", "target_kl"]
+        keys = [
+            "update_epochs", "minibatch_size", "batch_seq_len",
+            "clip_coef", "ent_coef", "hp_aux_coef",
+            "vf_coef", "clip_vloss", "max_grad_norm", "target_kl"
+        ]
         return {k: getattr(self, k) for k in keys}
 
 
@@ -250,12 +263,10 @@ class RunConfig:
 
         # Derive schema metadata (Source of Truth for input sizes)
         assembler = ObservationAssembler()
-        meta = assembler.get_schema_metadata()
-        meta["offsets"] = assembler.offsets
 
         return PokeTransformer(
             act_dim=int(self.env.act_dim),
-            meta=meta,
+            meta=assembler.meta,
             emb_dims=self.model.emb_dims,
             out_dims=self.model.out_dims,
             bank_dims=self.model.bank_dims,

@@ -6,7 +6,7 @@ passes
 """
 
 from __future__ import annotations
-
+import time
 import logging
 import os
 import re
@@ -72,6 +72,7 @@ class WeightStore:
     def __init__(self):
         self.weights = None
         self.version = -1
+        self.temp = 1.0
 
     def update(self, weights, version):
         self.weights = weights
@@ -83,6 +84,14 @@ class WeightStore:
     def get_weights(self):
         return self.weights
 
+    def set_temp(self, temp: float):
+        self.temp = float(temp)
+
+    def get_temp(self):
+        return self.temp
+
+    def get_meta(self):
+        return self.version, self.temp
 
 class InferenceActor:
     """
@@ -100,29 +109,69 @@ class InferenceActor:
         self.current_temp = cfg.learner.temp_start
         self.stats = InferenceStats()
         
+        self.mem_cache_by_tag: dict[str, list[torch.Tensor]] = {}
+        
         # Build main model and league models
         self.net = self.cfg.make_model().to(self.device).eval()
+        self.net.enable_bf16_recurrent_path()
         
         # Initial load
         self.resume_from_disk()
+        
+    def clear_cache(self, tag: str):
+        self.mem_cache_by_tag.pop(tag, None)
+
+    def clear_all_caches(self):
+        self.mem_cache_by_tag.clear()
+
+    def _zero_cache_row(self) -> List[torch.Tensor]:
+        return [
+            torch.zeros(1, 1, self.net.d_model, device=self.device)
+            for _ in range(self.net.n_layers)
+        ]
+
+    def _build_batched_mem_cache(self, tags: List[str]) -> List[torch.Tensor]:
+        rows_per_layer = [[] for _ in range(self.net.n_layers)]
+
+        for tag in tags:
+            cached = self.mem_cache_by_tag.get(tag)
+            if cached is None or len(cached) != self.net.n_layers:
+                cached = self._zero_cache_row()
+
+            for i in range(self.net.n_layers):
+                t = cached[i]
+                if t.device.type != torch.device(self.device).type:
+                    t = t.to(self.device, non_blocking=True)
+                rows_per_layer[i].append(t)
+
+        return [torch.cat(rows, dim=0) for rows in rows_per_layer]
+
+    def _store_new_mem_cache(self, tags: List[str], new_mem_cache: List[torch.Tensor]) -> None:
+        # clone() is important so we do not keep views into the whole batch alive
+        for b, tag in enumerate(tags):
+            self.mem_cache_by_tag[tag] = [
+                layer_cache[b:b+1].detach().clone()
+                for layer_cache in new_mem_cache
+            ]
 
     @torch.no_grad()
-    def infer_batch(self, obs_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def infer_batch(self, tags: List[str], obs_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Executes a batch forward pass for a single policy, ignoring legacy policy IDs.
         """
         self._sync_weights()
         
         B = obs_np.shape[0]
+        if len(tags) != B:
+            raise ValueError(f"len(tags)={len(tags)} != batch size {B}")
         self.stats.flushes += 1
         self.stats.total_requests += B
         self.stats.avg_batch_size = (self.stats.avg_batch_size * 0.95) + (B * 0.05)
 
         obs = torch.from_numpy(obs_np).to(self.device, non_blocking=True)
-
+        mem_cache = self._build_batched_mem_cache(tags)
         # Single forward pass for the entire batch
-        logits, _, value = self.net(obs)
-        
+        logits, v_logits, v_exp, new_mem_cache = self.net(obs, mem_cache=mem_cache)
         # Extract Action Mask
         m_start, m_end = self.net.unpacker.offsets["action_mask"]
         mask_sub = obs[:, m_start:m_end].float()
@@ -133,15 +182,13 @@ class InferenceActor:
             mask_sub[bad, 0] = 1.0 # Force struggle/default if no valid moves
         
         # Sample actions
-        act, logp, _ = masked_sample(logits, mask_sub, temp=self.current_temp)
+        act_game, logp_game, _ = masked_sample(logits, mask_sub, temp=self.current_temp)
+        self._store_new_mem_cache(tags, new_mem_cache)
 
-        # Sync before returning to CPU
-        torch.cuda.synchronize()
-        
         return (
-            act.cpu().numpy(),
-            logp.cpu().numpy(),
-            value.cpu().numpy()
+            act_game.cpu().numpy(),
+            logp_game.cpu().numpy(),
+            v_exp.cpu().numpy()
         )
     
     def set_temp(self, temp: float):
@@ -155,8 +202,9 @@ class InferenceActor:
         if latest_v > self.current_version:
             weights = ray.get(self.weight_store.get_weights.remote())
             if weights:
-                self.net.load_state_dict(weights, strict=True)
+                self.net.load_state_dict(weights, strict=False)
                 self.current_version = latest_v
+                self.clear_all_caches()
                 logger.info(f"InferenceActor synced to version {latest_v}")
 
     def resume_from_disk(self):

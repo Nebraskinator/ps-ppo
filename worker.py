@@ -163,7 +163,7 @@ class WorkerLearnerClient:
                 items.append(first)
             except asyncio.TimeoutError:
                 continue
-            
+
             # Greedily gather up to max_episodes
             while len(items) < self.cfg.learn_max_episodes:
                 try: items.append(self._q.get_nowait())
@@ -209,12 +209,19 @@ class WorkerInferenceClient:
         self._q: asyncio.Queue = asyncio.Queue(maxsize=self.cfg.infer_max_pending)
         self._task = asyncio.get_event_loop().create_task(self._loop())
 
-    async def request(self, obs_flat: np.ndarray) -> Tuple[int, float, float]:
+    async def request(self, tag: str, obs_flat: np.ndarray) -> Tuple[int, float, float]:
         """Submits an observation and waits for the action result."""
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
-        await self._q.put((fut, obs_flat))
+        await self._q.put((fut, tag, obs_flat))
         return await fut
+    
+    def clear_cache(self, tag: str) -> None:
+        """Fire-and-forget cache clear for finished/rescued battles."""
+        try:
+            self.inference_actor.clear_cache.remote(tag)
+        except Exception:
+            pass
 
     async def _loop(self):
         """Consumes the request queue and calls the remote inference actor."""
@@ -235,17 +242,21 @@ class WorkerInferenceClient:
                         items.append(self._q.get_nowait())
                     except asyncio.QueueEmpty:
                         break
-
-                obs_batch = np.stack([it[1] for it in items], axis=0)
+                
+                tags = [it[1] for it in items]
+                obs_batch = np.stack([it[2] for it in items], axis=0)
 
                 try:
                     # Await Ray ObjectRef directly for performance
-                    act, logp, val = await self.inference_actor.infer_batch.remote(obs_batch)
-                    for i, (fut, _) in enumerate(items):
-                        if not fut.done(): fut.set_result((int(act[i]), float(logp[i]), float(val[i])))
+                    act, logp, val = await self.inference_actor.infer_batch.remote(tags, obs_batch)
+                    
+                    for i, (fut, _, _) in enumerate(items):
+                        if not fut.done():
+                            fut.set_result((int(act[i]), float(logp[i]), float(val[i])))
+
                 except (GetTimeoutError, ActorUnavailableError) as e:
                     logger.warning(f"Inference Actor busy/dead: {e}")
-                    for fut, _ in items: fut.set_exception(e)
+                    for fut, _, _ in items: fut.set_exception(e)
             except Exception as e:
                 logger.error(f"Inference loop error: {e}")
                 await asyncio.sleep(0.1)
@@ -278,22 +289,24 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
         now = time.time()
         self._last_act_time[tag] = now
         self._battle_starts.setdefault(tag, now)
-
+        
         # Acquire Learner Slot if first turn
         if tag not in self._episode_slot_state:
             await self.learn_client.acquire_episode_slot()
             self._episode_slot_state[tag] = "acquired"
-
+            
         obs_flat = self.assembler.assemble(battle)
-
+        
         # Decide: Heuristic (Imitation) or Model (PPO)
         if self.cfg.learner.mode == "imitation":
             order = super().choose_move(battle)
+            
+            # Create the full action array and randomize the memory tokens
             action_idx = self.assembler.map_order_to_index(order, battle)
             logp, val = 0.0, 0.0
         else:
-            action_idx, logp, val = await self.infer_client.request(obs_flat)
-
+            action_idx, logp, val = await self.infer_client.request(tag, obs_flat)
+        
         # Log trajectory
         traj = self._traj.setdefault(tag, {"observations": [], "act": [], "logp": [], "val": []})
         traj["observations"].append(obs_flat)
@@ -363,6 +376,7 @@ class RayBatchedPlayer(SimpleHeuristicsPlayer):
         self._battle_starts.pop(tag, None)
         self._last_act_time.pop(tag, None)
         self._traj.pop(tag, None)
+        self.infer_client.clear_cache(tag)
         state = self._episode_slot_state.pop(tag, None)
         if state == "acquired":
             # Slot was taken, but data was never submitted. We must release it here.
@@ -427,7 +441,7 @@ class RolloutWorker:
         self.cfg = cfg
         self.infer_client = WorkerInferenceClient(inference_actor, cfg)
         self.learn_client = WorkerLearnerClient(learner_actor, cfg)
-        self.server_conf = make_server_conf("localhost", server_port)
+        self.server_conf = make_server_conf("127.0.0.1", server_port)
         self.pairs_count = pairs
         self.active_pairs: List[Tuple[RayBatchedPlayer, RayBatchedPlayer]] = []
         self.run_tag = secrets.token_hex(3)
@@ -441,12 +455,29 @@ class RolloutWorker:
                 pA = self._make_player(a_name, 2*i)
                 pB = self._make_player(b_name, 2*i + 1)
                 self.active_pairs.append((pA, pB))
-    
+            
             # Login and start spawning (Exact original sequence)
             players = [p for pair in self.active_pairs for p in pair]
-            await asyncio.gather(*[wait_for_login(p) for p in players])
+            async def wait_for_login_retry(player, attempts=5, delay=1.0):
+                last_err = None
+                for i in range(attempts):
+                    try:
+                        await wait_for_login(player)
+                        return
+                    except Exception as e:
+                        last_err = e
+                        print(
+                            f"[login state] user={player.username} "
+                            f"logged_in={getattr(player.ps_client, 'logged_in', None).is_set() if getattr(player, 'ps_client', None) else 'no_client'}",
+                            flush=True,
+                        )
+                        print(f"[login retry] {player.username} attempt {i+1}/{attempts} failed: {type(e).__name__}: {e}", flush=True)
+                        await asyncio.sleep(delay)
+                raise last_err
+            for p in players:
+                await wait_for_login_retry(p)
+                await asyncio.sleep(0.05)
             await asyncio.gather(*[join_lobby(p) for p in players])
-            
             await asyncio.gather(*[
                 safe_send(pA, f"/rlautospawn {pA.username}, {pB.username}, {self.cfg.env.battle_format}, {self.cfg.rollout.rooms_per_pair}", room="lobby")
                 for (pA, pB) in self.active_pairs
