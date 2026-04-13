@@ -9,7 +9,7 @@ def encode_global_inplace(battle, buffer, offset_tuple, vocab_map, vocab_lists):
     start, _ = offset_tuple
     
     # 1. Global Scalars
-    buffer[start] = battle.turn * 0.01
+    buffer[start] = battle.turn % 251
     buffer[start + 1] = 1.0 if battle.used_tera else 0.0
     buffer[start + 2] = 1.0 if battle.opponent_used_tera else 0.0
     

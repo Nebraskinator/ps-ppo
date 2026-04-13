@@ -66,6 +66,7 @@ class ModelConfig:
     n_layers: int = 3
     n_heads: int = 10
     ff_expansion: float = 4.0
+    kv_cache_len: int = 64
 
 
 @dataclass(frozen=True)
@@ -120,7 +121,7 @@ class InferenceConfig:
 class LearnerConfig:
     """Core PPO and Hyperparameter settings."""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    mode: str = "ppo"
+    mode: str = "warmup"
     
     # Reinforcement Learning Math
     gamma: float = 0.999
@@ -159,7 +160,7 @@ class LearnerConfig:
     clip_vloss: bool = False
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.02
-    steps_per_update: int = 32768
+    steps_per_update: int = 16384
 
     # Checkpointing
     ckpt_dir: str = "checkpoints"
@@ -175,9 +176,9 @@ class LearnerConfig:
         """Sets gradient multipliers based on the current TrainingMode."""
         # Use object.__setattr__ because the dataclass is frozen
         multipliers = {
-            "imitation": (1.0, 1.0, 0.0),
-            "warmup": (0.0, 0.0, 1.0),
-            "ppo": (1.0, 1.0, 2.0),
+            "imitation": (1.0, 1.0, 1.0), # backbone, actor, critic
+            "warmup": (0.0, 0.0, 1.0), # backbone, actor, critic
+            "ppo": (0.8, 1.0, 2.0), # backbone, actor, critic
         }
         backbone, pi, v = multipliers.get(self.mode, (1.0, 1.0, 1.0))
         
@@ -276,6 +277,7 @@ class RunConfig:
             v_bins=int(self.learner.v_bins),
             ff_expansion=self.model.ff_expansion,
             dropout=self.model.dropout,
+            kv_cache_len=self.model.kv_cache_len,
         )
 
     def as_dict(self) -> Dict[str, Any]:

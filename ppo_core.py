@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 # Numerical & Distributional Utils
 # ----------------------------
 
+TOKENS_PER_TURN = 15
+FIELD_IDX = 0
+ACTOR_IDX = 13
+CRITIC_IDX = 14
+
 def masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
     Applies a boolean mask to logits, setting invalid actions to a large negative value.
@@ -141,64 +146,56 @@ def logit_soft_cap(score, b, h, q_idx, kv_idx):
 # THE MASKS
 # ----------------------------------------
 
-def pokemon_episodic_mask(b, h, q_idx, kv_idx, episode_ids):
-    """
-    16 tokens per turn, ordered as:
-      0 = field
-      1..12 = pokemon
-      13 = actor
-      14 = critic
-      15 = mem
-
-    Training rule:
-    - every token can attend to every token in the same turn
-    - every token can attend to the previous turn's mem token
-    - nothing else
-    """
+def pokemon_episodic_mask(b, h, q_idx, kv_idx, episode_ids, n_prev_fields: int):
     same_ep = episode_ids[q_idx] == episode_ids[kv_idx]
 
-    q_t = q_idx // 16
-    kv_t = kv_idx // 16
-    kv_i = kv_idx % 16
+    q_t = q_idx // TOKENS_PER_TURN
+    kv_t = kv_idx // TOKENS_PER_TURN
+    kv_i = kv_idx % TOKENS_PER_TURN
 
-    same_turn = q_t == kv_t
-    bridge = (q_t == (kv_t + 1)) & (kv_i == 15)
+    same_turn = (q_t == kv_t)
+    prev_field = (
+        (kv_i == FIELD_IDX)
+        & (kv_t < q_t)
+        & ((q_t - kv_t) <= n_prev_fields)
+    )
 
-    return same_ep & (same_turn | bridge)
+    return same_ep & (same_turn | prev_field)
 
-def pokemon_batched_episodic_mask(b, h, q_idx, kv_idx, expanded_ids):
-    """
-    Batched training mask.
-
-    expanded_ids: [B_seq, S_tokens]
-    where S_tokens = batch_seq_len * 16
-    """
+def pokemon_batched_episodic_mask(b, h, q_idx, kv_idx, expanded_ids, n_prev_fields: int):
     same_ep = expanded_ids[b, q_idx] == expanded_ids[b, kv_idx]
 
-    q_t = q_idx // 16
-    kv_t = kv_idx // 16
-    kv_i = kv_idx % 16
+    q_t = q_idx // TOKENS_PER_TURN
+    kv_t = kv_idx // TOKENS_PER_TURN
+    kv_i = kv_idx % TOKENS_PER_TURN
 
-    same_turn = q_t == kv_t
-    bridge = (q_t == (kv_t + 1)) & (kv_i == 15)
+    same_turn = (q_t == kv_t)
+    prev_field = (
+        (kv_i == FIELD_IDX)
+        & (kv_t < q_t)
+        & ((q_t - kv_t) <= n_prev_fields)
+    )
 
-    return same_ep & (same_turn | bridge)
+    return same_ep & (same_turn | prev_field)
 
-def pokemon_inference_mask(b, h, q_idx, kv_idx):
-    """
-    Inference uses 17 tokens:
-      0..15 = current turn tokens in the same order as training
-      16    = previous turn's carried mem token
+def pokemon_inference_mask(b, h, q_idx, kv_idx, hist_len: torch.Tensor, n_prev_fields: int):
+    q_is_current = q_idx < TOKENS_PER_TURN
+    kv_is_current = kv_idx < TOKENS_PER_TURN
 
-    Rule:
-    - current-turn queries (0..15) can attend to all current-turn tokens and the history token
-    - history token query (16) only attends to itself
-    """
-    q_is_current = q_idx <= 15
-    kv_is_current = kv_idx <= 15
-    kv_is_hist = kv_idx == 16
+    kv_is_hist = (kv_idx >= TOKENS_PER_TURN) & (kv_idx < TOKENS_PER_TURN + n_prev_fields)
+    hist_slot = kv_idx - TOKENS_PER_TURN
 
-    return (q_is_current & (kv_is_current | kv_is_hist)) | ((q_idx == 16) & (kv_idx == 16))
+    # Right-aligned valid history:
+    # valid slots are [K - hist_len[b], ..., K-1]
+    kv_hist_valid = kv_is_hist & (hist_slot >= (n_prev_fields - hist_len[b]))
+
+    # Current queries can read current tokens + valid history fields.
+    current_rule = q_is_current & (kv_is_current | kv_hist_valid)
+
+    # History queries are inert/self-only. This also keeps padded queries safe.
+    history_rule = (q_idx >= TOKENS_PER_TURN) & (q_idx == kv_idx)
+
+    return current_rule | history_rule
 
 # ----------------------------------------
 # 2. FLEX MODULES (Hardware Optimized)
@@ -242,7 +239,7 @@ class FlexReadout(nn.Module):
       1 = critic
 
     Key/value tokens:
-      full 16-token current turn
+      full 15-token current turn
     """
     def __init__(self, d_model, n_heads, ff_expansion=2.0, dropout=0.0):
         super().__init__()
@@ -266,7 +263,7 @@ class FlexReadout(nn.Module):
     def forward(self, q_x: torch.Tensor, kv_x: torch.Tensor) -> torch.Tensor:
         """
         q_x:  [B, 2, D]   actor/critic query tokens
-        kv_x: [B, 16, D]  full current-turn tokens
+        kv_x: [B, 15, D]  full current-turn tokens
         """
         B, Q, D = q_x.shape
         K = kv_x.shape[1]
@@ -296,6 +293,8 @@ class PokeTransformer(nn.Module):
         self.d_model = out_dims["pokemon_vec"]
         self.n_heads, self.n_layers = n_heads, n_layers
         
+        self.kv_cache_len = kwargs.get("kv_cache_len", 64)
+        
         # Identity Embeddings
         self.pokemon_id_emb = nn.Embedding(meta["vocab_pokemon"], emb_dims["pokemon"])
         self.item_emb = nn.Embedding(meta["vocab_item"], emb_dims["item"])
@@ -309,12 +308,19 @@ class PokeTransformer(nn.Module):
         self.move_net = self._build_subnet(self._calc_move_in(emb_dims, bank_dims), out_dims["move_vec"])
         self.ability_net = self._build_subnet(emb_dims["ability"] * meta["n_ability_slots"], out_dims["ability_vec"])
         self.pokemon_net = self._build_subnet(self._calc_pok_in(emb_dims, bank_dims, out_dims), self.d_model)
-        self.field_net = self._build_subnet(bank_dims["val_100"] + (meta["dim_global_scalars"] - 1) + (emb_dims["move"] * 2) + meta["dim_transition_scalars"], self.d_model)
-
+        self.field_net = self._build_subnet(
+                bank_dims["power"]
+                + (meta["dim_global_scalars"] - 1)
+                + (emb_dims["move"] * 2)
+                + (emb_dims["pokemon"] * 4)
+                + (emb_dims["ability"] * 2)
+                + (emb_dims["item"] * 2)
+                + meta["dim_transition_scalars"],
+                self.d_model,
+            )
         # Decision Tokens
         self.actor_tok = nn.Parameter(torch.randn(1, 1, self.d_model))
         self.critic_tok = nn.Parameter(torch.randn(1, 1, self.d_model))
-        self.mem_tok = nn.Parameter(torch.randn(1, 1, self.d_model))
         
         self.transformer = nn.ModuleList([FlexEncoderLayer(self.d_model, n_heads) for _ in range(n_layers)])
         self.readout = FlexReadout(self.d_model, n_heads)
@@ -367,7 +373,6 @@ class PokeTransformer(nn.Module):
     
         self.actor_tok.data = self.actor_tok.data.bfloat16()
         self.critic_tok.data = self.critic_tok.data.bfloat16()
-        self.mem_tok.data = self.mem_tok.data.bfloat16()
     
     def recurrent_dtype(self) -> torch.dtype:
         return self.actor_tok.dtype
@@ -405,39 +410,48 @@ class PokeTransformer(nn.Module):
         p_tokens = self.pokemon_net(p_in.view(-1, p_in.shape[-1])).view(B, 12, -1)
 
         field_in = torch.cat([
-            self.val_100_emb(torch.clamp(obs["global_scalars"][:, self.f_map["global"]["turn_int"]] * 100, 0, 100).long()),
-            obs["global_scalars"][:, self.f_map["global"]["remainder_raw"][0] : ].to(rec_dtype),
-            self.move_emb(obs["transition_move_ids"].long()).view(B, -1), 
-            obs["transition_scalars"].to(rec_dtype)
+            self.power_emb(
+                obs["global_scalars"][:, self.f_map["global"]["turn_int"]].long()
+            ),
+            obs["global_scalars"][:, self.f_map["global"]["remainder_raw"][0]:].to(rec_dtype),
+        
+            self.move_emb(obs["transition_move_ids"]).view(B, -1),
+            self.pokemon_id_emb(obs["transition_pokemon_ids"]).view(B, -1),
+            self.ability_emb(obs["transition_ability_ids"]).view(B, -1),
+            self.item_emb(obs["transition_item_ids"]).view(B, -1),
+        
+            obs["transition_scalars"].to(rec_dtype),
         ], dim=-1)
         field_token = self.field_net(field_in).unsqueeze(1)
         return field_token, p_tokens
 
     def forward(self, obs_flat: torch.Tensor, 
                 episode_ids: torch.Tensor = None, 
-                mem_cache: list[torch.Tensor] = None,
+                kv_cache: list[torch.Tensor] = None,
+                kv_cache_len: torch.Tensor = None,
                 batch_seq_len: int = 0,):
         B = obs_flat.shape[0]
         device = obs_flat.device
+        K = self.kv_cache_len
+        
         field_tok, p_toks = self.encode_features(obs_flat)
         
         current_turn = torch.cat([
-            field_tok,                         # 0
-            p_toks,                            # 1-12
-            self.actor_tok.expand(B, 1, -1),   # 13
-            self.critic_tok.expand(B, 1, -1),  # 14
-            self.mem_tok.expand(B, 1, -1),     # 15
-        ], dim=1)
+                field_tok,                          # 0
+                p_toks,                             # 1-12
+                self.actor_tok.expand(B, 1, -1),    # 13
+                self.critic_tok.expand(B, 1, -1),   # 14
+            ], dim=1)  # [B, 15, D]
 
         # --- PACKED TRAINING MODE ---
         if episode_ids is not None:
             n_seq = B // batch_seq_len
-            s_tok = batch_seq_len * 16
-            x = current_turn.view(n_seq, batch_seq_len, 16, self.d_model).reshape(n_seq, s_tok, self.d_model)
-            expanded_ids = episode_ids.view(n_seq, batch_seq_len, 1).expand(-1, -1, 16).reshape(n_seq, s_tok)
+            s_tok = batch_seq_len * TOKENS_PER_TURN
+            x = current_turn.view(n_seq, batch_seq_len, TOKENS_PER_TURN, self.d_model).reshape(n_seq, s_tok, self.d_model)
+            expanded_ids = episode_ids.view(n_seq, batch_seq_len, 1).expand(-1, -1, TOKENS_PER_TURN).reshape(n_seq, s_tok)
 
             b_mask = create_block_mask(
-                lambda b, h, q, k: pokemon_batched_episodic_mask(b, h, q, k, expanded_ids),
+                lambda b, h, q, k: pokemon_batched_episodic_mask(b, h, q, k, expanded_ids, K),
                 B=n_seq,
                 H=1,
                 Q_LEN=s_tok,
@@ -446,44 +460,65 @@ class PokeTransformer(nn.Module):
             )
 
             for layer in self.transformer: x = layer(x, b_mask)
-            turn_x = x.view(n_seq * batch_seq_len, 16, self.d_model)
-            read_q = turn_x[:, 13:15, :]
+            turn_x = x.view(n_seq * batch_seq_len, TOKENS_PER_TURN, self.d_model)
+            read_q = turn_x[:, ACTOR_IDX:CRITIC_IDX + 1, :]
             readout = self.readout(read_q, turn_x)
             
             pi = self.pi_head(readout[:, 0, :]).float()
             v  = self.v_head(readout[:, 1, :]).float()
             v_exp = (torch.softmax(v, dim=-1) * self.v_support).sum(dim=-1)
-            return pi, v, v_exp.float(), None
+            return pi, v, v_exp.float(), None, None
 
         # --- BATCHED INFERENCE MODE ---
-        S = 17
-        b_mask = create_block_mask(pokemon_inference_mask, B=None, H=None, Q_LEN=S, KV_LEN=S, device=device)
+        if kv_cache_len is None:
+            kv_cache_len = torch.zeros(B, dtype=torch.long, device=device)
+        else:
+            kv_cache_len = kv_cache_len.to(device=device, dtype=torch.long)
+        S = TOKENS_PER_TURN + K
+        b_mask = create_block_mask(
+        lambda b, h, q, k: pokemon_inference_mask(
+                    b, h, q, k, kv_cache_len, K
+                ),
+                B=B,
+                H=1,
+                Q_LEN=S,
+                KV_LEN=S,
+                device=device,
+            )
+        
+        hist_pos = torch.arange(K, device=device).unsqueeze(0)                 # [1, K]
+        hist_valid = hist_pos >= (K - kv_cache_len.unsqueeze(1)) 
         
         x = current_turn
-        new_mem_cache = []
+        new_kv_cache = []
+        new_kv_cache_len = torch.clamp(kv_cache_len + 1, max=K)
 
         for i, layer in enumerate(self.transformer):
-            # 1. Cache the raw input to THIS layer for the next turn
-            new_mem_cache.append(x[:, 15:16, :])
+            # Cache the INPUT field token for this layer to match packed training semantics
+            cur_field_in = x[:, FIELD_IDX:FIELD_IDX + 1, :]   # [B, 1, D]
             
-            # 2. Fetch the historical input to THIS layer from the previous turn
-            if mem_cache is not None:
-                prev_mem_L = mem_cache[i].to(device=device, dtype=x.dtype, non_blocking=True)
+            if kv_cache is not None:
+                hist_fields_L = kv_cache[i].to(device=device, dtype=x.dtype, non_blocking=True)
             else:
-                prev_mem_L = torch.zeros(B, 1, self.d_model, device=device, dtype=x.dtype)
+                hist_fields_L = torch.zeros(B, K, self.d_model, device=device, dtype=x.dtype)
+                
+            hist_fields_L = hist_fields_L * hist_valid.unsqueeze(-1).to(x.dtype)
             # 3. Process
-            x_17 = torch.cat([x, prev_mem_L], dim=1)
-            x_17 = layer(x_17, b_mask)
-            x = x_17[:, :16, :] # Strip history token
+            x_full  = torch.cat([x, hist_fields_L], dim=1)
+            x_full  = layer(x_full , b_mask)
+            x = x_full[:, :TOKENS_PER_TURN, :]
+            # Update layer cache: right-aligned, keep last K
+            updated_hist = torch.cat([hist_fields_L, cur_field_in], dim=1)[:, -K:, :]
+            new_kv_cache.append(updated_hist)
         
-        read_q = x[:, 13:15, :]      # [B, 2, D]
+        read_q = x[:, ACTOR_IDX:CRITIC_IDX + 1, :]      # [B, 2, D]
         readout = self.readout(read_q, x)
         
         pi = self.pi_head(readout[:, 0, :])  # actor
         v  = self.v_head(readout[:, 1, :])   # critic
         v_exp = (torch.softmax(v, dim=-1) * self.v_support).sum(dim=-1)
         
-        return pi.float(), v.float(), v_exp.float(), new_mem_cache
+        return pi.float(), v.float(), v_exp.float(), new_kv_cache, new_kv_cache_len
     
 class ObservationUnpacker(nn.Module):
     """
@@ -498,6 +533,8 @@ class ObservationUnpacker(nn.Module):
         self.offsets = meta["offsets"]
         self.dim_body = meta["dim_pokemon_body"]
         self.dim_move_sc = meta["dim_move_scalars"] // 4
+        self.dim_transition_sc = meta["dim_transition_scalars"]
+        self.transition_map = meta["feature_map"]["transition"]
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         out = {name: x[:, start:end] for name, (start, end) in self.offsets.items()}
@@ -508,8 +545,14 @@ class ObservationUnpacker(nn.Module):
         out["ability_ids"]  = out["ability_ids"].reshape(-1, 12, 4).to(torch.long)
         out["move_ids"]     = out["move_ids"].reshape(-1, 12, 4).to(torch.long)
         out["move_scalars"] = out["move_scalars"].reshape(-1, 12, 4, self.dim_move_sc)
-        out["transition_move_ids"] = out["transition_move_ids"].reshape(-1, 2).to(torch.long)
-        out["transition_scalars"]  = out["transition_scalars"].reshape(-1, 10)
+        out["transition_ids"] = out["transition_ids"].reshape(-1, self.meta["dim_transition_ids"]).to(torch.long)
+        out["transition_scalars"] = out["transition_scalars"].reshape(-1, self.dim_transition_sc)
+        
+        tmap = self.transition_map
+        out["transition_move_ids"] = out["transition_ids"][:, tmap["move_ids"][0]:tmap["move_ids"][1]]
+        out["transition_pokemon_ids"] = out["transition_ids"][:, tmap["pokemon_ids"][0]:tmap["pokemon_ids"][1]]
+        out["transition_ability_ids"] = out["transition_ids"][:, tmap["ability_ids"][0]:tmap["ability_ids"][1]]
+        out["transition_item_ids"] = out["transition_ids"][:, tmap["item_ids"][0]:tmap["item_ids"][1]]
         
         return out
 
@@ -658,14 +701,18 @@ def ppo_update(
             m_start, m_end = net.unpacker.offsets["action_mask"]
             mb_mask = mb_obs[:, m_start:m_end]
             
-            logits, v_logits, _, _ = net(mb_obs, 
+            logits, v_logits, _, _, _ = net(mb_obs, 
                                          mb_ep_ids, 
                                          batch_seq_len=cfg["batch_seq_len"],
                                          )
 
             if mode == "imitation":
-                loss = nn.functional.cross_entropy(logits.float(), mb_act, label_smoothing=0.1)
-                pg_loss = loss; v_loss = ent_loss = approx_kl = clip_frac = torch.tensor(0.0, device=dev)
+                pg_loss = nn.functional.cross_entropy(logits.float(), mb_act, label_smoothing=0.1)
+                ent_loss = approx_kl = clip_frac = torch.tensor(0.0, device=dev)
+                
+                target_dist = twohot_targets(mb_ret, v_min=cfg["v_min"], v_max=cfg["v_max"], v_bins=cfg["v_bins"])
+                v_loss = dist_value_loss(v_logits, target_dist)
+                loss = pg_loss + v_loss
             elif mode == "warmup":
                 target_dist = twohot_targets(mb_ret, v_min=cfg["v_min"], v_max=cfg["v_max"], v_bins=cfg["v_bins"])
                 loss = dist_value_loss(v_logits, target_dist)

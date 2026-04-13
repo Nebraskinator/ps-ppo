@@ -109,7 +109,8 @@ class InferenceActor:
         self.current_temp = cfg.learner.temp_start
         self.stats = InferenceStats()
         
-        self.mem_cache_by_tag: dict[str, list[torch.Tensor]] = {}
+        self.kv_cache_by_tag: dict[str, list[torch.Tensor]] = {}
+        self.kv_cache_len_by_tag: dict[str, int] = {}
         
         # Build main model and league models
         self.net = self.cfg.make_model().to(self.device).eval()
@@ -119,39 +120,59 @@ class InferenceActor:
         self.resume_from_disk()
         
     def clear_cache(self, tag: str):
-        self.mem_cache_by_tag.pop(tag, None)
-
+        self.kv_cache_by_tag.pop(tag, None)
+        self.kv_cache_len_by_tag.pop(tag, None)
+    
     def clear_all_caches(self):
-        self.mem_cache_by_tag.clear()
+        self.kv_cache_by_tag.clear()
+        self.kv_cache_len_by_tag.clear()
 
     def _zero_cache_row(self) -> List[torch.Tensor]:
+        K = self.net.kv_cache_len
         return [
-            torch.zeros(1, 1, self.net.d_model, device=self.device)
+            torch.zeros(1, K, self.net.d_model, device=self.device)
             for _ in range(self.net.n_layers)
         ]
 
-    def _build_batched_mem_cache(self, tags: List[str]) -> List[torch.Tensor]:
+    def _build_batched_kv_cache(self, tags: List[str]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        K = self.net.kv_cache_len
         rows_per_layer = [[] for _ in range(self.net.n_layers)]
-
+        lens = []
+    
         for tag in tags:
-            cached = self.mem_cache_by_tag.get(tag)
+            cached = self.kv_cache_by_tag.get(tag)
+            cached_len = int(self.kv_cache_len_by_tag.get(tag, 0))
+    
             if cached is None or len(cached) != self.net.n_layers:
                 cached = self._zero_cache_row()
-
+                cached_len = 0
+    
+            cached_len = max(0, min(cached_len, K))
+            lens.append(cached_len)
+    
             for i in range(self.net.n_layers):
                 t = cached[i]
                 if t.device.type != torch.device(self.device).type:
                     t = t.to(self.device, non_blocking=True)
                 rows_per_layer[i].append(t)
+    
+        batched = [torch.cat(rows, dim=0) for rows in rows_per_layer]
+        lens_t = torch.tensor(lens, dtype=torch.long, device=self.device)
+        return batched, lens_t
 
-        return [torch.cat(rows, dim=0) for rows in rows_per_layer]
-
-    def _store_new_mem_cache(self, tags: List[str], new_mem_cache: List[torch.Tensor]) -> None:
-        # clone() is important so we do not keep views into the whole batch alive
+    def _store_new_kv_cache(
+        self,
+        tags: List[str],
+        new_kv_cache: List[torch.Tensor],
+        new_kv_cache_len: torch.Tensor,
+    ) -> None:
+        new_kv_cache_len = new_kv_cache_len.detach().to("cpu")
+    
         for b, tag in enumerate(tags):
-            self.mem_cache_by_tag[tag] = [
+            self.kv_cache_len_by_tag[tag] = int(new_kv_cache_len[b].item())
+            self.kv_cache_by_tag[tag] = [
                 layer_cache[b:b+1].detach().clone()
-                for layer_cache in new_mem_cache
+                for layer_cache in new_kv_cache
             ]
 
     @torch.no_grad()
@@ -164,14 +185,21 @@ class InferenceActor:
         B = obs_np.shape[0]
         if len(tags) != B:
             raise ValueError(f"len(tags)={len(tags)} != batch size {B}")
+            
         self.stats.flushes += 1
         self.stats.total_requests += B
         self.stats.avg_batch_size = (self.stats.avg_batch_size * 0.95) + (B * 0.05)
 
         obs = torch.from_numpy(obs_np).to(self.device, non_blocking=True)
-        mem_cache = self._build_batched_mem_cache(tags)
-        # Single forward pass for the entire batch
-        logits, v_logits, v_exp, new_mem_cache = self.net(obs, mem_cache=mem_cache)
+        
+        kv_cache, kv_cache_len = self._build_batched_kv_cache(tags)
+
+        logits, v_logits, v_exp, new_kv_cache, new_kv_cache_len = self.net(
+            obs,
+            kv_cache=kv_cache,
+            kv_cache_len=kv_cache_len,
+        )
+        
         # Extract Action Mask
         m_start, m_end = self.net.unpacker.offsets["action_mask"]
         mask_sub = obs[:, m_start:m_end].float()
@@ -183,7 +211,7 @@ class InferenceActor:
         
         # Sample actions
         act_game, logp_game, _ = masked_sample(logits, mask_sub, temp=self.current_temp)
-        self._store_new_mem_cache(tags, new_mem_cache)
+        self._store_new_kv_cache(tags, new_kv_cache, new_kv_cache_len)
 
         return (
             act_game.cpu().numpy(),

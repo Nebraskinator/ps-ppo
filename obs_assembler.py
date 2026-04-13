@@ -18,7 +18,7 @@ from obs_abilities import encode_ability_inplace
 from obs_global import encode_global_inplace
 from obs_moves import encode_moves_inplace
 from obs_pokemon import encode_pokemon_body_inplace
-from obs_transitions import encode_transitions_inplace
+from obs_transitions import encode_transitions_inplace, transition_id_dim, transition_scalar_dim
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -54,6 +54,8 @@ class ObservationAssembler:
         self.pokemon_scalar_dim = self.meta["dim_pokemon_body"]
         self.move_scalar_dim = self.meta["dim_move_scalars"]
         self.global_dim = self.meta["dim_global_scalars"]
+        self.transition_id_dim = self.meta["dim_transition_ids"]
+        self.transition_scalar_dim = self.meta["dim_transition_scalars"]
         self.action_dim = self.meta["action_dim"]
 
         # Define the layout of the flattened observation vector
@@ -64,8 +66,8 @@ class ObservationAssembler:
             ("move_ids", (12, 4), 48),
             ("move_scalars", (12, self.move_scalar_dim), 12 * self.move_scalar_dim),
             ("global_scalars", (self.global_dim,), self.global_dim),
-            ("transition_move_ids", (2,), 2),
-            ("transition_scalars", (10,), 10),
+            ("transition_ids", (self.transition_id_dim,), self.transition_id_dim),
+            ("transition_scalars", (self.transition_scalar_dim,), self.transition_scalar_dim),
             ("action_mask", (self.action_dim,), self.action_dim)
         ]
 
@@ -133,12 +135,23 @@ class ObservationAssembler:
         )
 
         # 3. ENCODE TRANSITIONS (Move History & Type Effectiveness)
-        events = getattr(battle.observations.get(battle.turn, battle.current_observation), 'events', [])
+        events = getattr(
+            battle.observations.get(battle.turn, battle.current_observation),
+            "events",
+            [],
+        )
+        
+        player_role = getattr(battle, "player_role", None)
+        if player_role not in ("p1", "p2"):
+            player_role = "p1"  # safe fallback; you can also raise here if preferred
+        
         encode_transitions_inplace(
-            events, self.calc_buf, 
-            off["transition_move_ids"][0], 
-            off["transition_scalars"][0], 
-            self.vocab_map
+            events,
+            self.calc_buf,
+            off["transition_ids"][0],
+            off["transition_scalars"][0],
+            self.vocab_map,
+            self_is_p1=(player_role == "p1"),
         )
 
         # 4. ENCODE ACTION MASK
@@ -302,9 +315,20 @@ class ObservationAssembler:
         return {
             "dim_pokemon_body": dim_pokemon_body,
             "dim_move_scalars": dim_move_scalars,
-            "dim_transition_scalars": 10,
+            "dim_transition_ids": transition_id_dim(),
+            "dim_transition_scalars": transition_scalar_dim(),
             "dim_global_scalars": 3 + weather_len + (side_len * 2),
-            "feature_map": {"body": body_map, "move": move_map, "global": {"turn_int": 0, "remainder_raw": (1, None)}},
+            "feature_map": {"body": body_map, 
+                            "move": move_map, 
+                            "global": {"turn_int": 0, 
+                                       "remainder_raw": (1, None)},
+                            "transition": {
+                                "move_ids": (0, 2),
+                                "pokemon_ids": (2, 6),
+                                "ability_ids": (6, 8),
+                                "item_ids": (8, 10),
+                                },
+                            },
             "faint_internal_idx": 101 + 1,
             "vocab_pokemon": len(vocab_lists["pokemon.species"]) + 1,
             "vocab_item": len(vocab_lists["pokemon.item"]) + 1,
@@ -315,7 +339,7 @@ class ObservationAssembler:
             "n_pokemon_slots": 12,
             "n_move_slots": 4,
             "n_ability_slots": 4,
-            "n_transition_moves": 2,
+            "n_transition_ids": transition_id_dim(),
         }
     
     def translate_relative_index(self, block_name: str, relative_idx: int) -> str:
