@@ -88,7 +88,7 @@ class ObservationAssembler:
         with open(path, "r") as f:
             return json.load(f)
 
-    def assemble(self, battle: Any) -> np.ndarray:
+    def assemble(self, battle: Any, events: List[List[str]] = None) -> np.ndarray:
         """
         Converts a Battle state into a flattened NumPy array.
 
@@ -135,11 +135,6 @@ class ObservationAssembler:
         )
 
         # 3. ENCODE TRANSITIONS (Move History & Type Effectiveness)
-        events = getattr(
-            battle.observations.get(battle.turn, battle.current_observation),
-            "events",
-            [],
-        )
         
         player_role = getattr(battle, "player_role", None)
         if player_role not in ("p1", "p2"):
@@ -162,7 +157,7 @@ class ObservationAssembler:
 
     def create_action_mask(self, battle: Any, self_team: List[Any]) -> np.ndarray:
         """
-        Generates a valid action mask to prevent illegal model predictions.
+        Generates a valid action mask using poke-env 0.15's native engine.
         
         0-3: Moves, 4-9: Switches, 10-13: Terastallize + Moves.
         """
@@ -172,49 +167,38 @@ class ObservationAssembler:
         if not active_mon:
             return mask 
 
-        is_reviving = getattr(battle, 'reviving', False)
-        force_switch = battle.force_switch
-        avail_moves = battle.available_moves
-        avail_species = {p.species for p in battle.available_switches}
+        # 1. HANDLE MOVES & TERA (0-3 & 10-13)
+        # In 0.15, if force_switch is true, available_moves is natively empty.
+        if battle.available_moves:
+            mon_moves = list(active_mon.moves.values())
+            for available_move in battle.available_moves:
+                try:
+                    idx = mon_moves.index(available_move)
+                    if idx < 4:
+                        mask[idx] = 1.0
+                        if battle.can_tera:
+                            mask[idx + 10] = 1.0
+                except ValueError:
+                    pass # Handles edge cases like dynamically generated Struggle
 
-        # Handle Moves and Terastallization
-        if not force_switch and not is_reviving:
-            for i, move in enumerate(active_mon.moves.values()):
-                if i >= 4: break
-                if move in avail_moves:
-                    mask[i] = 1.0
-                    if battle.can_tera:
-                        mask[i + 10] = 1.0
-            
-            # Struggle fallback
-            if not mask[:4].any() and avail_moves:
+            # Struggle fallback (if available_moves yielded something not in our move list)
+            if not mask[:4].any():
                 mask[0] = 1.0 
 
-        # Handle Switches and Revivals
-        is_trapped = getattr(battle, 'trapped', False) or getattr(battle, 'maybe_trapped', False)
-        can_switch = force_switch or is_reviving or not is_trapped
-        
-        if can_switch or avail_species:
-            for i, mon in enumerate(self_team[:6]):
-                if not mon: continue
-                
-                # 1. Trusted Server Response
-                if mon.species in avail_species:
-                    if is_reviving:
-                        if mon.fainted: # ONLY allow fainted mons to be picked
-                            mask[4 + i] = 1.0
-                    elif not mon.fainted and not mon.active:
-                        mask[4 + i] = 1.0
-                    continue
-                
-                # 2. Fallback for state desyncs (e.g., Zoroark Illusion)
-                if is_reviving:
-                    if mon.fainted: # ONLY allow fainted mons to be picked
-                        mask[4 + i] = 1.0
-                elif force_switch:
-                    if not mon.active and mon.current_hp > 0: mask[4 + i] = 1.0
+        # 2. HANDLE SWITCHES & REVIVALS (4-9)
+        # In 0.15, available_switches natively handles trapped, reviving, and fainting states.
+        if battle.available_switches:
+            for available_switch in battle.available_switches:
+                try:
+                    # Map the available switch to the static 6-slot self_team array
+                    idx = self_team.index(available_switch)
+                    if idx < 6:
+                        mask[4 + idx] = 1.0
+                except ValueError:
+                    pass
 
-        # Safety: Ensure at least one action is always valid
+        # 3. SAFETY FALLBACK
+        # Ensure at least one action is always valid so the NN never deadlocks
         if not mask.any():
             mask[0] = 1.0
             
@@ -250,12 +234,15 @@ class ObservationAssembler:
         return "DEFAULT", {}
 
     def map_order_to_index(self, order: Any, battle: Any) -> int:
-        """Reverse-maps a BattleOrder to a policy index (used for Imitation Learning)."""
-        if not order or not hasattr(order, "order") or order.order is None:
+        """Reverse-maps a 0.15 BattleOrder to a policy index (used for Imitation Learning)."""
+        if not order or getattr(order, "message", None):
+            return 0 # Handle string/DEFAULT orders
+            
+        choice = getattr(order, "order", None)
+        if not choice:
             return 0
             
-        choice = order.order
-        # Case A: Move/Tera
+        # Case A: Move/Tera (0.15 exposes Move objects)
         if hasattr(choice, "base_power"):
             active_mon = battle.active_pokemon
             if not active_mon: return 0
@@ -266,11 +253,14 @@ class ObservationAssembler:
                 return move_slot
             except ValueError:
                 return 0
-        # Case B: Switch
+                
+        # Case B: Switch (0.15 exposes Pokemon objects)
         elif hasattr(choice, "current_hp"):
             team_list = list(battle.team.values())
-            try: return 4 + team_list.index(choice)
-            except ValueError: return 4
+            try: 
+                return 4 + team_list.index(choice)
+            except ValueError: 
+                return 4
 
         return 0
 
@@ -282,9 +272,11 @@ class ObservationAssembler:
         if vocab_lists is None:
             with open("vocab.json", "r") as f:
                 vocab_lists = json.load(f)
-        v_type = len(vocab_lists["pokemon.type"]) + 1
-        v_effect = len(vocab_lists["pokemon.effect"]) + 1
-        v_status = len(vocab_lists["pokemon.status"]) + 1
+                
+        v_type = len(vocab_lists.get("pokemon.type", [])) + 1
+        v_effect = len(vocab_lists.get("pokemon.effect", [])) + 1
+        v_status = len(vocab_lists.get("pokemon.status", [])) + 1
+        v_gender = len(vocab_lists.get("pokemon.gender", [])) + 1
         
         # Pokemon Body Mapping
         body_map = {
@@ -298,26 +290,34 @@ class ObservationAssembler:
             "types_raw": (113, 113 + (v_type * 2)),
             "effects_raw": (113 + (v_type * 2), 113 + (v_type * 2) + v_effect),
             "status_raw": (113 + (v_type * 2) + v_effect, 113 + (v_type * 2) + v_effect + v_status),
+            "gender_raw": (113 + (v_type * 2) + v_effect + v_status, 113 + (v_type * 2) + v_effect + v_status + v_gender),
             "pos_raw": (-12, None)
         }
-        dim_pokemon_body = 113 + (v_type * 2) + v_effect + v_status + 12
+        dim_pokemon_body = 113 + (v_type * 2) + v_effect + v_status + v_gender + 12
 
         # Move Map
+        v_move_cat = len(vocab_lists.get("move.category", [])) + 1
+        v_move_target = len(vocab_lists.get("move.target", [])) + 1
+        
         move_map = {
             "acc_int": 0, "pwr_int": 1, "pp_int": 2,
-            "onehots_raw": (3, 19), "type_raw": (19, 19 + v_type)
+            "onehots_raw": (3, 19), 
+            "type_raw": (19, 19 + v_type),
+            "category_raw": (19 + v_type, 19 + v_type + v_move_cat),
+            "target_raw": (19 + v_type + v_move_cat, 19 + v_type + v_move_cat + v_move_target)
         }
-        dim_move_scalars = (19 + v_type) * 4
+        dim_move_scalars = (19 + v_type + v_move_cat + v_move_target) * 4
         
-        weather_len = len(vocab_lists["global.weather"]) + 1 + 10
-        side_len = len(vocab_lists["global.side_condition"]) + 1
+        weather_len = len(vocab_lists.get("global.weather", [])) + 1 + 10
+        field_len = len(vocab_lists.get("global.field", [])) + 1 
+        side_len = len(vocab_lists.get("global.side_condition", [])) + 1
 
         return {
             "dim_pokemon_body": dim_pokemon_body,
             "dim_move_scalars": dim_move_scalars,
             "dim_transition_ids": transition_id_dim(),
             "dim_transition_scalars": transition_scalar_dim(),
-            "dim_global_scalars": 3 + weather_len + (side_len * 2),
+            "dim_global_scalars": 3 + weather_len + field_len + (side_len * 2),
             "feature_map": {"body": body_map, 
                             "move": move_map, 
                             "global": {"turn_int": 0, 
@@ -330,10 +330,10 @@ class ObservationAssembler:
                                 },
                             },
             "faint_internal_idx": 101 + 1,
-            "vocab_pokemon": len(vocab_lists["pokemon.species"]) + 1,
-            "vocab_item": len(vocab_lists["pokemon.item"]) + 1,
-            "vocab_ability": len(vocab_lists["pokemon.ability"]) + 1,
-            "vocab_move": len(vocab_lists["move.id"]) + 1,
+            "vocab_pokemon": len(vocab_lists.get("pokemon.species", [])) + 1,
+            "vocab_item": len(vocab_lists.get("pokemon.item", [])) + 1,
+            "vocab_ability": len(vocab_lists.get("pokemon.ability", [])) + 1,
+            "vocab_move": len(vocab_lists.get("move.id", [])) + 1,
             "vocab_type": v_type,
             "action_dim": 14,
             "n_pokemon_slots": 12,
@@ -377,6 +377,15 @@ class ObservationAssembler:
                 if relative_idx == 1: return "p1_tera_flag"
                 if relative_idx == 2: return "p2_tera_flag"
                 return f"weather_or_side_condition[{relative_idx}]"
+            
+            elif block_name == "transition_ids":
+                names = ["P1_Move", "P2_Move", "P1_Actor", "P1_Target", "P2_Actor", "P2_Target", "P1_Abil", "P2_Abil", "P1_Item", "P2_Item"]
+                return names[relative_idx] if relative_idx < len(names) else f"TransID[{relative_idx}]"
+            
+            elif block_name == "transition_scalars":
+                side = "P1" if relative_idx < 45 else "P2"
+                idx = relative_idx % 45
+                return f"{side}_Transition_Scalar[{idx}]"
                 
         except Exception:
             pass

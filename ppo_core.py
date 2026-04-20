@@ -339,10 +339,23 @@ class PokeTransformer(nn.Module):
             if isinstance(m, (nn.Linear, nn.Embedding)): 
                 nn.init.normal_(m.weight, std=0.02)
                 if hasattr(m, 'bias') and m.bias is not None: nn.init.zeros_(m.bias)
+        # Depth-scaled initialization for residual projections
+        # Scale by 1 / sqrt(2 * n_layers) because there are 2 residual additions per layer (Attn + FFN)
+        std_proj = 0.02 / (2 * self.n_layers) ** 0.5
+        
+        for layer in self.transformer:
+            # Scale the Attention output projection
+            nn.init.normal_(layer.out_proj.weight, std=std_proj)
+            # Scale the final FFN linear layer (which is at index 2 in your nn.Sequential)
+            nn.init.normal_(layer.ff[2].weight, std=std_proj)
+            
+        # Also scale the Readout module's residual projections
+        nn.init.normal_(self.readout.out_proj.weight, std=std_proj)
+        nn.init.normal_(self.readout.ff[2].weight, std=std_proj)
 
     def _calc_move_in(self, emb, bank):
         m = self.f_map["move"]
-        return emb["move"] + (bank["val_100"] * 2) + bank["power"] + (m["type_raw"][1] - m["onehots_raw"][0])
+        return emb["move"] + (bank["val_100"] * 2) + bank["power"] + (m["target_raw"][1] - m["onehots_raw"][0])
 
     def _calc_pok_in(self, emb, bank, out):
         b = self.f_map["body"]
@@ -390,7 +403,8 @@ class PokeTransformer(nn.Module):
             self.val_100_emb(m_sc[..., self.f_map["move"]["acc_int"]].long()),
             self.power_emb(m_sc[..., self.f_map["move"]["pwr_int"]].long()),
             self.val_100_emb(m_sc[..., self.f_map["move"]["pp_int"]].long()),
-            m_sc[..., self.f_map["move"]["onehots_raw"][0] : self.f_map["move"]["type_raw"][1]].to(rec_dtype)
+            # UPDATED: Replaced type_raw with target_raw to include Category and Target
+            m_sc[..., self.f_map["move"]["onehots_raw"][0] : self.f_map["move"]["target_raw"][1]].to(rec_dtype)
         ], dim=-1)
         m_vecs = self.move_net(m_combined.view(-1, m_combined.shape[-1])).view(B, 12, -1)
         a_vecs = self.ability_net(self.ability_emb(obs["ability_ids"]).view(B, 12, -1))
@@ -692,9 +706,14 @@ def ppo_update(
     n_mb = 0
     stop_training = False
     
+    grad_accum_steps = cfg.get("grad_accum_steps", 1)
+    
     for epoch in range(cfg.get("update_epochs", 1)):
         epoch_kl, epoch_mb = 0.0, 0
-        for (mb_obs, mb_act, mb_logp_old, _, mb_adv, mb_ret, _,mb_ep_ids) in dataset.iter_minibatches(cfg["minibatch_size"], shuffle_episodes=True):
+        
+        opt.zero_grad(set_to_none=True)
+        
+        for i, (mb_obs, mb_act, mb_logp_old, _, mb_adv, mb_ret, _,mb_ep_ids) in enumerate(dataset.iter_minibatches(cfg["minibatch_size"], shuffle_episodes=True)):
             mb_act, mb_logp_old, mb_adv, mb_ret, mb_ep_ids = (t.to(dev) for t in [mb_act, mb_logp_old, mb_adv, mb_ret, mb_ep_ids])
 
             mb_obs = mb_obs.to(dev, non_blocking=True)
@@ -738,13 +757,16 @@ def ppo_update(
                 # Track KL and Clip Frac for the Game Action specifically so you can monitor true agent health
                 approx_kl = (mb_logp_old - logp_game).mean() 
                 clip_frac = ((ratio_game - 1.0).abs() > cfg["clip_coef"]).float().mean()
+                
+            scaled_loss = loss / grad_accum_steps
+            scaled_loss.backward()
 
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(net.parameters(), cfg["max_grad_norm"])
-            opt.step()
-            if scheduler is not None:
-                scheduler.step()
+            if (i + 1) % grad_accum_steps == 0:
+                nn.utils.clip_grad_norm_(net.parameters(), cfg["max_grad_norm"])
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                if scheduler is not None:
+                    scheduler.step()
 
             # Stats update
             n_mb += 1; epoch_mb += 1
@@ -756,7 +778,14 @@ def ppo_update(
                 logger.info(f"Early stop at Epoch {epoch} due to KL {epoch_kl/epoch_mb:.4f}")
                 stop_training = True
                 break
-            
+        
+        if not stop_training and (i + 1) % grad_accum_steps != 0:
+            nn.utils.clip_grad_norm_(net.parameters(), cfg["max_grad_norm"])
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            if scheduler is not None:
+                scheduler.step()
+        
         if stop_training:
             break
 

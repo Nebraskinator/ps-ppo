@@ -2,8 +2,8 @@
 Move Encoder for Pokémon Showdown Reinforcement Learning.
 
 This module encodes the 4-move set of a Pokémon into a structured numerical format.
-It captures discrete properties (ID, Type) and continuous/ordinal properties 
-(Power, Accuracy, PP, Priority) to inform the agent's tactical decision-making.
+It captures discrete properties (ID, Type, Category, Target) and continuous/ordinal 
+properties (Power, Accuracy, PP, Priority).
 """
 
 from __future__ import annotations
@@ -27,21 +27,20 @@ def get_move_scalar_dim(vocab_lists: Dict[str, List[str]]) -> int:
     
     Structure per move:
     - 3 Ints: Accuracy, Power, PP
-    - 3 Flags: Physical, Special, Status
-    - 13 Flags: Priority One-hot
+    - 16 Slots (onehots_raw): Priority One-hot (slots 6-18)
     - N Flags: Type One-hot
-    
-    Total = 19 + Type_Vocab_Size
+    - N Flags: Category One-hot
+    - N Flags: Target One-hot
     """
-    type_len = len(vocab_lists["pokemon.type"]) + 1  # +1 for None/Unknown
-    return 19 + type_len
+    type_len = len(vocab_lists.get("pokemon.type", [])) + 1
+    cat_len = len(vocab_lists.get("move.category", [])) + 1
+    target_len = len(vocab_lists.get("move.target", [])) + 1
+    
+    return 19 + type_len + cat_len + target_len
 
 def get_accuracy_int(move: Any) -> int:
     """
     Normalizes move accuracy to a 0-100 integer.
-    
-    Handles poke-env's specific behaviors where 'True' means infinite accuracy 
-    (e.g., Aerial Ace) and fractional accuracies exist.
     """
     acc = getattr(move, "accuracy", 100)
     
@@ -49,7 +48,6 @@ def get_accuracy_int(move: Any) -> int:
         return 100
     
     if isinstance(acc, (int, float)):
-        # Normalize 0.0-1.0 range to 0-100 if necessary
         return int(acc) if acc > 1.0 else int(acc * 100)
         
     return 100
@@ -66,18 +64,7 @@ def encode_moves_inplace(
 ) -> None:
     """
     Encodes a Pokémon's 4 active moves into the observation buffer.
-
-    Args:
-        mon: The poke-env Pokemon object.
-        buffer: The main NumPy calculation buffer.
-        mon_idx: The global index of the Pokémon (0-11).
-        scalar_dim: The size of the scalar vector *per move* (not per mon).
-        offsets: Dictionary of buffer region start/end indices.
-        vocab: The ID lookup map.
-        vocab_lists: Raw vocabulary lists for calculating dimensions.
-        opponent_team: (Unused) Kept for interface compatibility with older versions.
     """
-    # 1. Calculate Offsets
     try:
         id_base, _ = offsets["move_ids"]
         sc_base, _ = offsets["move_scalars"]
@@ -85,21 +72,14 @@ def encode_moves_inplace(
         logger.error(f"Missing offset key: {e}")
         return
 
-    # Each Pokémon has 4 move slots
     id_start_mon = id_base + (mon_idx * MOVES_PER_MON)
     
-    # Calculate scalar start: Base + (Mon_Index * 4_Moves * Dim_Per_Move)
-    # Note: 'scalar_dim' passed here is actually (4 * single_move_dim) from assembler.
-    # We recalculate single_move_dim to be safe.
     single_move_dim = get_move_scalar_dim(vocab_lists)
     sc_start_mon = sc_base + (mon_idx * MOVES_PER_MON * single_move_dim)
 
     if mon is None:
         return
 
-    # 2. Iterate through Moves
-    # We use enumerate to fill slots 0, 1, 2, 3. 
-    # If a mon has <4 moves, the remaining slots stay zeroed.
     for m_idx, move in enumerate(mon.moves.values()):
         if m_idx >= MOVES_PER_MON:
             break
@@ -108,32 +88,40 @@ def encode_moves_inplace(
         buffer[id_start_mon + m_idx] = get_id(vocab, "move.id", move.id)
         
         # --- B. Move Scalars ---
-        # Calculate start index for this specific move's scalar block
         s = sc_start_mon + (m_idx * single_move_dim)
 
-        # 1. Core Stats (Integers for Embedding Banks)
+        # 1. Core Stats
         buffer[s] = get_accuracy_int(move)          # Index 0
         buffer[s + 1] = int(move.base_power)        # Index 1
         buffer[s + 2] = int(move.current_pp)        # Index 2
 
-        # 2. Category (One-hot)
-        # Indices 3, 4, 5
-        cat = move.category.name.upper()
-        if cat == "PHYSICAL":
-            buffer[s + 3] = 1.0
-        elif cat == "SPECIAL":
-            buffer[s + 4] = 1.0
-        elif cat == "STATUS":
-            buffer[s + 5] = 1.0
+        # Note: Indices 3, 4, 5 were previously hardcoded Category slots.
+        # They are now intentionally left at 0.0, and Category is handled dynamically below.
 
-        # 3. Priority (One-hot)
-        # Indices 6 to 18 (13 slots)
-        # Maps priority -6 to index 0, priority 0 to index 6, priority +6 to index 12
+        # 2. Priority (One-hot) -> Indices 6 to 18
         prio_idx = int(move.priority + PRIORITY_OFFSET)
         if 0 <= prio_idx < PRIORITY_BINS:
             buffer[s + 6 + prio_idx] = 1.0
 
-        # 4. Move Type (One-hot)
-        # Indices 19+
-        t_idx = get_id(vocab, "pokemon.type", move.type.name.lower())
-        buffer[s + 19 + t_idx] = 1.0
+        # Set up a rolling pointer for the dynamic one-hot blocks
+        curr = s + 19
+
+        # 3. Move Type (One-hot)
+        if move.type:
+            t_idx = get_id(vocab, "pokemon.type", move.type.name.lower())
+            if t_idx > 0:
+                buffer[curr + t_idx] = 1.0
+        curr += len(vocab_lists.get("pokemon.type", [])) + 1
+
+        # 4. Move Category (NEW - Dynamic One-hot)
+        if move.category:
+            c_idx = get_id(vocab, "move.category", move.category.name.lower())
+            if c_idx > 0:
+                buffer[curr + c_idx] = 1.0
+        curr += len(vocab_lists.get("move.category", [])) + 1
+
+        # 5. Move Target (NEW - Dynamic One-hot)
+        if move.target:
+            tgt_idx = get_id(vocab, "move.target", move.target.name.lower())
+            if tgt_idx > 0:
+                buffer[curr + tgt_idx] = 1.0

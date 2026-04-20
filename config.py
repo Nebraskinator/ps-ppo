@@ -32,27 +32,27 @@ class ModelConfig:
     
     # Dedicated Embedding Sizes
     emb_dims: Dict[str, int] = field(default_factory=lambda: {
-        "pokemon": 96,
-        "item": 96,
-        "ability": 96,
-        "move": 96,
+        "pokemon": 192,
+        "item": 128,
+        "ability": 192,
+        "move": 192,
         "action": 12,
     })
     
     # Dedicated Subnet Output Sizes
     out_dims: Dict[str, int] = field(default_factory=lambda: {
-        "move_vec": 128,
-        "ability_vec": 128,
-        "pokemon_vec": 1280,
+        "move_vec": 256,
+        "ability_vec": 256,
+        "pokemon_vec": 1536,
         "global_vec": 256,
-        "transition_vec": 256,
+        "transition_vec": 1024,
     })
     
     # Universal Embedding Bank Sizes
     bank_dims: Dict[str, int] = field(default_factory=lambda: {
         "val_100": 128,  # HP, Level, Acc, PP
-        "stat": 128,     # Base Stats, Weight, Height
-        "power": 128,    # Move Power
+        "stat": 256,     # Base Stats, Weight, Height
+        "power": 192,    # Move Power
     })
     
     # Vocabulary Safety Caps
@@ -63,8 +63,8 @@ class ModelConfig:
     })
     
     dropout: float = 0.0
-    n_layers: int = 3
-    n_heads: int = 10
+    n_layers: int = 6
+    n_heads: int = 12
     ff_expansion: float = 4.0
     kv_cache_len: int = 64
 
@@ -92,11 +92,11 @@ class RolloutConfig:
     infer_wait_ms: float = 3.0
     infer_max_pending: int = 20000
 
-    learn_min_episodes: int = 32
-    learn_max_episodes: int = 256
-    learn_wait_ms: float = 5.0
-    learn_max_pending_episodes: int = 15000
-    learn_max_pending_batches: int = 15000
+    learn_min_episodes: int = 1
+    learn_max_episodes: int = 32
+    learn_wait_ms: float = 1.0
+    learn_max_pending_episodes: int = 25000
+    learn_max_pending_batches: int = 20000
 
     def worker_kwargs(self) -> Dict[str, Any]:
         """Returns a dictionary suitable for RolloutWorker initialization."""
@@ -121,7 +121,7 @@ class InferenceConfig:
 class LearnerConfig:
     """Core PPO and Hyperparameter settings."""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    mode: str = "warmup"
+    mode: str = "ppo"
     
     # Reinforcement Learning Math
     gamma: float = 0.999
@@ -139,10 +139,10 @@ class LearnerConfig:
     temp_total_steps: int = 500_000
     
     # Optimizer settings
-    lr: float = 2e-4
+    lr: float = 1e-4
     lr_warmup_steps: int = 1_000
-    lr_hold_steps: int = 50_000
-    lr_total_steps: int = 150_000
+    lr_hold_steps: int = 200_000
+    lr_total_steps: int = 600_000
     weight_decay: float = 1e-2
     
     # Layer-specific LR multipliers (initialized in __post_init__)
@@ -152,10 +152,11 @@ class LearnerConfig:
     
     # PPO Specifics
     update_epochs: int = 6
-    minibatch_size: int = 4096
+    minibatch_size: int = 2048
+    grad_accum_steps: int = 1
     batch_seq_len: int = 256
-    clip_coef: float = 0.15
-    ent_coef: float = 0.04
+    clip_coef: float = 0.1
+    ent_coef: float = 0.01
     vf_coef: float = 0.5
     clip_vloss: bool = False
     max_grad_norm: float = 0.5
@@ -178,7 +179,7 @@ class LearnerConfig:
         multipliers = {
             "imitation": (1.0, 1.0, 1.0), # backbone, actor, critic
             "warmup": (0.0, 0.0, 1.0), # backbone, actor, critic
-            "ppo": (0.8, 1.0, 2.0), # backbone, actor, critic
+            "ppo": (0.1, 1.0, 2.0), # backbone, actor, critic
         }
         backbone, pi, v = multipliers.get(self.mode, (1.0, 1.0, 1.0))
         

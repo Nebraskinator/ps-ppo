@@ -75,17 +75,19 @@ async def main():
     weight_store = WeightStore.remote()
 
     # Define Remote Actors with Resource Constraints
-    # Fractional GPUs allow both actors to coexist on a single high-end GPU
+    # Splitting the GPU between Learner (0.65) and Inference (0.35)
     InferRemote = ray.remote(num_gpus=0.35)(InferenceActor)
     LearnerRemote = ray.remote(num_gpus=0.65)(LearnerActor)
+    
+    # Workers no longer need num_gpus because they just pass data!
     WorkerRemote = ray.remote(num_cpus=1)(RolloutWorker).options(
-        max_restarts=-1,  # Infinite restarts for robustness
+        max_restarts=-1,  
         max_task_retries=0
     )
 
-    # Spawn Core Actors
+    # Spawn Core Actors 
     infer = InferRemote.remote(cfg_ref, weight_store)
-    learner = LearnerRemote.remote(cfg_ref, infer, weight_store)
+    learner = LearnerRemote.remote(cfg_ref, weight_store)
 
     # 3. Spawn Rollout Workers
     workers = []
@@ -95,9 +97,9 @@ async def main():
             continue
 
         worker_actor = WorkerRemote.remote(
-            cfg_ref,
-            infer,
-            learner,
+            cfg=cfg_ref,
+            inference_actor=infer,
+            learner_actor=learner,
             pairs=count,
             server_port=port,
         )
@@ -140,7 +142,7 @@ async def main():
             wstats_refs = [w.heartbeat.remote() for w in workers]
 
             # Ray 2.0+ pattern: Combine refs and fetch via ray.get in a thread
-            results = await asyncio.to_thread(ray.get, [istats_ref, lstats_ref] + wstats_refs)
+            results = await asyncio.to_thread(ray.get, [istats_ref] + [lstats_ref] + wstats_refs)
             
             istats = results[0]
             lstats = results[1]
@@ -148,14 +150,13 @@ async def main():
 
             # Aggregate worker-side metrics
             total_active = sum(w.get("active_battles_worker", 0) for w in wstats_list)
-            total_library = sum(w.get("active_battles_library", 0) for w in wstats_list)
-            avg_lag = sum(w.get("loop_lag_ms", 0) for w in wstats_list) / max(len(wstats_list), 1)
+            #max_q = max((w.get("learner_q_size", 0) for w in wstats_list), default=0)
+            #total_traj = sum(w.get("traj_in_memory", 0) for w in wstats_list)
 
             # Professional telemetry print
-            # wbat: battles tracked by worker, pbat: battles tracked by poke-env library
-            # MS: Average event loop lag in milliseconds
             stats_msg = (
-                f"[Telemetry] WBAT: {total_active} | PBAT: {total_library} | LAG: {avg_lag:.2f}ms | "
+                f"[Telemetry] ACTIVE: {total_active} | "
+                #f"LQ: {max_q} | TRAJ_BUF: {total_traj} | "
                 f"INFER: {istats} | TRAIN: {lstats}"
             )
             logger.info(stats_msg)

@@ -17,7 +17,9 @@ import numpy as np
 import ray
 import torch
 from config import RunConfig
+import ppo_core
 from ppo_core import masked_sample
+from obs_assembler import ObservationAssembler
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -108,6 +110,7 @@ class InferenceActor:
         self.current_version = -1
         self.current_temp = cfg.learner.temp_start
         self.stats = InferenceStats()
+        self.assembler = ObservationAssembler()
         
         self.kv_cache_by_tag: dict[str, list[torch.Tensor]] = {}
         self.kv_cache_len_by_tag: dict[str, int] = {}
@@ -115,6 +118,7 @@ class InferenceActor:
         # Build main model and league models
         self.net = self.cfg.make_model().to(self.device).eval()
         self.net.enable_bf16_recurrent_path()
+        self._last_sync_time = None
         
         # Initial load
         self.resume_from_disk()
@@ -201,7 +205,7 @@ class InferenceActor:
         )
         
         # Extract Action Mask
-        m_start, m_end = self.net.unpacker.offsets["action_mask"]
+        m_start, m_end = self.assembler.offsets["action_mask"]
         mask_sub = obs[:, m_start:m_end].float()
         
         bad = (mask_sub.sum(dim=1) <= 0.49)
@@ -224,16 +228,32 @@ class InferenceActor:
 
     def _sync_weights(self):
         """Pulls updated weights from the WeightStore if a new version is available."""
-        # Use a lightweight version check before pulling the heavy state_dict
-        latest_v = ray.get(self.weight_store.get_version.remote())
-        
-        if latest_v > self.current_version:
-            weights = ray.get(self.weight_store.get_weights.remote())
-            if weights:
-                self.net.load_state_dict(weights, strict=False)
-                self.current_version = latest_v
-                self.clear_all_caches()
-                logger.info(f"InferenceActor synced to version {latest_v}")
+        # --- THE THROTTLE ---
+        now = time.time()
+        if self._last_sync_time:
+            if now - self._last_sync_time < 5.0:
+                return
+        self._last_sync_time = now
+        # --------------------
+
+        try:
+            # Use a lightweight version check before pulling the heavy state_dict
+            latest_v = ray.get(self.weight_store.get_version.remote(), timeout=1.0)
+            
+            if latest_v > self.current_version:
+                weights = ray.get(self.weight_store.get_weights.remote(), timeout=2.0)
+                if weights:
+                    self.net.load_state_dict(weights, strict=False)
+                    self.current_version = latest_v
+                    self.clear_all_caches()
+                    
+                    # --- SYNC TEMPERATURE ---
+                    self.current_temp = ray.get(self.weight_store.get_temp.remote())
+                    # ------------------------
+                    
+                    logger.info(f"InferenceActor synced to version {latest_v} | Temp: {self.current_temp:.3f}")
+        except Exception:
+            pass # Prevent timeout errors from crashing the GPU loop
 
     def resume_from_disk(self):
         """Initializes the actor with the latest weights found in the checkpoint directory."""

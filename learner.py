@@ -41,10 +41,9 @@ class LearnerActor:
         opt: AdamW optimizer with layer-specific parameter groups.
     """
 
-    def __init__(self, cfg: RunConfig, inference_actor: ray.actor.ActorHandle, weight_store: ray.actor.ActorHandle):
+    def __init__(self, cfg: RunConfig, weight_store: ray.actor.ActorHandle):
         self.run_cfg = cfg
         self.cfg = cfg.learner
-        self.inference_actor = inference_actor
         self.weight_store = weight_store
 
         # Device verification
@@ -330,7 +329,7 @@ class LearnerActor:
             
             # Update Temperature
             new_temp = self.cfg.get_temp(self.total_steps)
-            self.inference_actor.set_temp.remote(new_temp)
+            self.weight_store.set_temp.remote(new_temp)
 
             logger.info(f"Update {self.update_idx}: Loss={stats.total_loss:.3f}, KL={stats.approx_kl:.4f}")
             print(
@@ -517,7 +516,6 @@ class LearnerActor:
                     new_wd = float(getattr(self.cfg, "weight_decay", 0.01))
                     for pg in self.opt.param_groups:
                         # Only apply to groups that were originally intended to have decay
-                        # (Your init logic sets WD to 0.0 for stable/norm groups)
                         if pg["weight_decay"] > 0:
                             pg["weight_decay"] = new_wd
                     print(f"[learner] ⚡ Weight Decay Override: Updated to {new_wd}")
@@ -532,8 +530,9 @@ class LearnerActor:
         self.total_episodes = int(ckpt.get("total_episodes", 0))
         self.total_steps = int(ckpt.get("total_steps", 0))
         
+        # Push resumed temperature to the WeightStore
         new_temp = self.cfg.get_temp(self.total_steps)
-        self.inference_actor.set_temp.remote(new_temp)
+        self.weight_store.set_temp.remote(new_temp)
 
         if "torch_rng" in ckpt:
             rng = ckpt["torch_rng"]
