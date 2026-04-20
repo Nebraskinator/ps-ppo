@@ -114,13 +114,19 @@ class SyncLearnerClient:
     def __init__(self, learner_actor, cfg: RunConfig):
         self.learner_actor = learner_actor
         self.cfg = cfg.rollout
-        self.q = queue.Queue(maxsize=self.cfg.learn_max_pending_batches)
+        self.q = queue.Queue(maxsize=self.cfg.learn_max_pending_batches * self.cfg.learn_max_episodes)
         threading.Thread(target=self._worker, daemon=True).start()
 
     def submit_episode(self, obs: np.ndarray, act: np.ndarray, logp: np.ndarray, 
                        val: np.ndarray, rew: np.ndarray, done: np.ndarray) -> bool:
+        # If the queue is full, evict the oldest trajectory
         if self.q.full():
-            return False
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                pass
+                
+        # Now there is guaranteed room for the absolute newest data
         self.q.put_nowait((obs, act, logp, val, rew, done))
         return True
 
@@ -133,7 +139,7 @@ class SyncLearnerClient:
             
             packed = self._prepare_batch(items)
             try:
-                self.learner_actor.submit_packed_batch.remote(*packed)
+                ray.get(self.learner_actor.submit_packed_batch.remote(*packed))
             except Exception as e:
                 logger.error(f"Learner submission failed: {e}")
 

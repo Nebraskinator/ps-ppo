@@ -116,6 +116,7 @@ class InferenceActor:
         self.kv_cache_len_by_tag: dict[str, int] = {}
         
         # Build main model and league models
+        ppo_core.flex_attention = torch.compile(ppo_core.flex_attention)
         self.net = self.cfg.make_model().to(self.device).eval()
         self.net.enable_bf16_recurrent_path()
         self._last_sync_time = None

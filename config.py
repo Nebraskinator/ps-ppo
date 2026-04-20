@@ -79,7 +79,7 @@ class EnvConfig:
 @dataclass(frozen=True)
 class RolloutConfig:
     """Settings for distributed rollout workers and batching logic."""
-    target_concurrent_battles: int = 2048
+    target_concurrent_battles: int = 800
     rooms_per_pair: int = 32
 
     # Timeouts
@@ -87,16 +87,16 @@ class RolloutConfig:
     open_timeout: float = 30.0
 
     # Batching constraints
-    infer_min_batch: int = 256
+    infer_min_batch: int = 32
     infer_max_batch: int = 2048
     infer_wait_ms: float = 3.0
     infer_max_pending: int = 20000
 
     learn_min_episodes: int = 1
-    learn_max_episodes: int = 32
+    learn_max_episodes: int = 8
     learn_wait_ms: float = 1.0
-    learn_max_pending_episodes: int = 25000
-    learn_max_pending_batches: int = 20000
+    learn_max_pending_episodes: int = 220
+    learn_max_pending_batches: int = 6 
 
     def worker_kwargs(self) -> Dict[str, Any]:
         """Returns a dictionary suitable for RolloutWorker initialization."""
@@ -125,7 +125,7 @@ class LearnerConfig:
     
     # Reinforcement Learning Math
     gamma: float = 0.999
-    gae_lambda: float = 0.75
+    gae_lambda: float = 0.95
     
     # Distributional Value (Two-Hot Encoding)
     use_twohot_value: bool = True
@@ -151,9 +151,9 @@ class LearnerConfig:
     lr_v_mult: float = field(init=False)
     
     # PPO Specifics
-    update_epochs: int = 6
-    minibatch_size: int = 2048
-    grad_accum_steps: int = 1
+    update_epochs: int = 3
+    minibatch_size: int = 1536
+    grad_accum_steps: int = 4
     batch_seq_len: int = 256
     clip_coef: float = 0.1
     ent_coef: float = 0.01
@@ -161,7 +161,7 @@ class LearnerConfig:
     clip_vloss: bool = False
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.02
-    steps_per_update: int = 16384
+    steps_per_update: int = 18432
 
     # Checkpointing
     ckpt_dir: str = "checkpoints"
