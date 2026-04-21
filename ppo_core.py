@@ -315,7 +315,8 @@ class PokeTransformer(nn.Module):
                 + (emb_dims["pokemon"] * 4)
                 + (emb_dims["ability"] * 2)
                 + (emb_dims["item"] * 2)
-                + meta["dim_transition_scalars"],
+                + meta["dim_transition_scalars"]
+                + meta["action_dim"],
                 self.d_model,
             )
         # Decision Tokens
@@ -435,6 +436,7 @@ class PokeTransformer(nn.Module):
             self.item_emb(obs["transition_item_ids"]).view(B, -1),
         
             obs["transition_scalars"].to(rec_dtype),
+            obs["action_mask"].to(rec_dtype),
         ], dim=-1)
         field_token = self.field_net(field_in).unsqueeze(1)
         return field_token, p_tokens

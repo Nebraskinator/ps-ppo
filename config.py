@@ -63,9 +63,9 @@ class ModelConfig:
     })
     
     dropout: float = 0.0
-    n_layers: int = 6
-    n_heads: int = 12
-    ff_expansion: float = 4.0
+    n_layers: int = 4
+    n_heads: int = 24
+    ff_expansion: float = 2.0
     kv_cache_len: int = 64
 
 
@@ -139,7 +139,7 @@ class LearnerConfig:
     temp_total_steps: int = 500_000
     
     # Optimizer settings
-    lr: float = 4e-4
+    lr: float = 3e-4
     lr_warmup_steps: int = 1_000
     lr_hold_steps: int = 200_000
     lr_total_steps: int = 600_000
@@ -152,8 +152,8 @@ class LearnerConfig:
     
     # PPO Specifics
     update_epochs: int = 3
-    minibatch_size: int = 1536
-    grad_accum_steps: int = 4
+    minibatch_size: int = 4096
+    grad_accum_steps: int = 1
     batch_seq_len: int = 256
     clip_coef: float = 0.1
     ent_coef: float = 0.01
@@ -161,7 +161,7 @@ class LearnerConfig:
     clip_vloss: bool = False
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.02
-    steps_per_update: int = 36864
+    steps_per_update: int = 16384
 
     # Checkpointing
     ckpt_dir: str = "checkpoints"
