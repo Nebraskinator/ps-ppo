@@ -517,11 +517,12 @@ class RolloutWorker:
                     body_history = obs_stacked[:, b_start:b_end].reshape(T, 12, self.assembler.meta["dim_pokemon_body"])
                     is_fainted = body_history[:, :, faint_idx] > 0.5
                     
-                    ds = np.diff(is_fainted[:, :6].sum(axis=1), prepend=is_fainted[0, :6].sum())
-                    do = np.diff(is_fainted[:, 6:].sum(axis=1), prepend=is_fainted[0, 6:].sum())
+                    ds = np.diff(is_fainted[:, :6].sum(axis=1))
+                    do = np.diff(is_fainted[:, 6:].sum(axis=1))
 
-                    rewards = (np.maximum(0, ds) * float(self.cfg.reward.faint_self)) + \
-                              (np.maximum(0, do) * float(self.cfg.reward.faint_opp))
+                    # Apply to rewards[:-1] to align the consequence with the action
+                    rewards[:-1] += (np.maximum(0, ds) * float(self.cfg.reward.faint_self)) + \
+                                    (np.maximum(0, do) * float(self.cfg.reward.faint_opp))
 
                 rewards[-1] += terminal_reward
                 dones = np.zeros(T, dtype=np.float32)

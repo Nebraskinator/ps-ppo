@@ -93,7 +93,7 @@ class RolloutConfig:
     infer_max_pending: int = 20000
 
     learn_min_episodes: int = 1
-    learn_max_episodes: int = 8
+    learn_max_episodes: int = 16
     learn_wait_ms: float = 1.0
     learn_max_pending_episodes: int = 220
     learn_max_pending_batches: int = 6 
@@ -121,11 +121,11 @@ class InferenceConfig:
 class LearnerConfig:
     """Core PPO and Hyperparameter settings."""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    mode: str = "ppo"
+    mode: str = "imitation"
     
     # Reinforcement Learning Math
     gamma: float = 0.999
-    gae_lambda: float = 0.95
+    gae_lambda: float = 0.97
     
     # Distributional Value (Two-Hot Encoding)
     use_twohot_value: bool = True
@@ -139,7 +139,7 @@ class LearnerConfig:
     temp_total_steps: int = 500_000
     
     # Optimizer settings
-    lr: float = 1e-4
+    lr: float = 4e-4
     lr_warmup_steps: int = 1_000
     lr_hold_steps: int = 200_000
     lr_total_steps: int = 600_000
@@ -161,7 +161,7 @@ class LearnerConfig:
     clip_vloss: bool = False
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.02
-    steps_per_update: int = 18432
+    steps_per_update: int = 36864
 
     # Checkpointing
     ckpt_dir: str = "checkpoints"
@@ -179,7 +179,7 @@ class LearnerConfig:
         multipliers = {
             "imitation": (1.0, 1.0, 1.0), # backbone, actor, critic
             "warmup": (0.0, 0.0, 1.0), # backbone, actor, critic
-            "ppo": (0.1, 1.0, 2.0), # backbone, actor, critic
+            "ppo": (0.4, 1.0, 2.0), # backbone, actor, critic
         }
         backbone, pi, v = multipliers.get(self.mode, (1.0, 1.0, 1.0))
         
