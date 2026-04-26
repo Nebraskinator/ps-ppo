@@ -32,27 +32,26 @@ class ModelConfig:
     
     # Dedicated Embedding Sizes
     emb_dims: Dict[str, int] = field(default_factory=lambda: {
-        "pokemon": 192,
-        "item": 128,
-        "ability": 192,
-        "move": 192,
-        "action": 12,
+        "pokemon": 128,
+        "item": 64,
+        "ability": 128,
+        "move": 128,
+        "action": 14,
     })
     
     # Dedicated Subnet Output Sizes
     out_dims: Dict[str, int] = field(default_factory=lambda: {
-        "move_vec": 256,
-        "ability_vec": 256,
-        "pokemon_vec": 1536,
-        "global_vec": 256,
-        "transition_vec": 1024,
+        "ability_vec": 96,
+        "pokemon_vec": 768,
+        "global_vec": 128,
+        "transition_vec": 512,
     })
     
     # Universal Embedding Bank Sizes
     bank_dims: Dict[str, int] = field(default_factory=lambda: {
-        "val_100": 128,  # HP, Level, Acc, PP
+        "val_100": 64,  # HP, Level, Acc, PP
         "stat": 256,     # Base Stats, Weight, Height
-        "power": 192,    # Move Power
+        "power": 128,    # Move Power
     })
     
     # Vocabulary Safety Caps
@@ -63,9 +62,9 @@ class ModelConfig:
     })
     
     dropout: float = 0.0
-    n_layers: int = 4
-    n_heads: int = 24
-    ff_expansion: float = 2.0
+    n_layers: int = 3
+    n_heads: int = 16
+    ff_expansion: float = 4.0
     kv_cache_len: int = 64
 
 
@@ -96,7 +95,7 @@ class RolloutConfig:
     learn_max_episodes: int = 16
     learn_wait_ms: float = 1.0
     learn_max_pending_episodes: int = 220
-    learn_max_pending_batches: int = 6 
+    learn_max_pending_batches: int = 3 
 
     def worker_kwargs(self) -> Dict[str, Any]:
         """Returns a dictionary suitable for RolloutWorker initialization."""
@@ -129,9 +128,9 @@ class LearnerConfig:
     
     # Distributional Value (Two-Hot Encoding)
     use_twohot_value: bool = True
-    v_min: float = -1.6
-    v_max: float = 1.6
-    v_bins: int = 51
+    v_min: float = -1.5
+    v_max: float = 1.5
+    v_bins: int = 31
     
     # Schedules
     temp_start: float = 1.0
@@ -139,10 +138,10 @@ class LearnerConfig:
     temp_total_steps: int = 500_000
     
     # Optimizer settings
-    lr: float = 3e-4
-    lr_warmup_steps: int = 1_000
-    lr_hold_steps: int = 200_000
-    lr_total_steps: int = 600_000
+    lr: float = 1e-4
+    lr_warmup_steps: int = 5_000
+    lr_hold_steps: int = 100_000
+    lr_total_steps: int = 30_000
     weight_decay: float = 1e-2
     
     # Layer-specific LR multipliers (initialized in __post_init__)
@@ -152,16 +151,16 @@ class LearnerConfig:
     
     # PPO Specifics
     update_epochs: int = 3
-    minibatch_size: int = 4096
+    minibatch_size: int = 1024
     grad_accum_steps: int = 1
     batch_seq_len: int = 256
     clip_coef: float = 0.1
-    ent_coef: float = 0.01
+    ent_coef: float = 0.02
     vf_coef: float = 0.5
     clip_vloss: bool = False
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.02
-    steps_per_update: int = 16384
+    steps_per_update: int = 10240
 
     # Checkpointing
     ckpt_dir: str = "checkpoints"
@@ -177,9 +176,9 @@ class LearnerConfig:
         """Sets gradient multipliers based on the current TrainingMode."""
         # Use object.__setattr__ because the dataclass is frozen
         multipliers = {
-            "imitation": (1.0, 1.0, 1.0), # backbone, actor, critic
+            "imitation": (1.0, 1.0, 0.6), # backbone, actor, critic
             "warmup": (0.0, 0.0, 1.0), # backbone, actor, critic
-            "ppo": (0.4, 1.0, 2.0), # backbone, actor, critic
+            "ppo": (0.5, 1.0, 2.0), # backbone, actor, critic
         }
         backbone, pi, v = multipliers.get(self.mode, (1.0, 1.0, 1.0))
         

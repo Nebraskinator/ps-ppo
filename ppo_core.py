@@ -25,10 +25,10 @@ logger = logging.getLogger(__name__)
 # Numerical & Distributional Utils
 # ----------------------------
 
-TOKENS_PER_TURN = 15
+TOKENS_PER_TURN = 64
 FIELD_IDX = 0
-ACTOR_IDX = 13
-CRITIC_IDX = 14
+ACTOR_IDX = 62
+CRITIC_IDX = 63
 
 def masked_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
@@ -79,6 +79,28 @@ def dist_value_loss(v_logits: torch.Tensor, target_dist: torch.Tensor) -> torch.
     logp = torch.log_softmax(v_logits, dim=-1)
     return -(target_dist * logp).sum(dim=-1).mean()
 
+import math
+
+def get_sinusoidal_encoding(num_positions: int, embedding_dim: int) -> torch.Tensor:
+    """
+    Generates a sinusoidal positional encoding matrix.
+    Args:
+        num_positions: The vocabulary size (e.g., 101 for val_100).
+        embedding_dim: The dimension of the embedding (e.g., 128).
+    Returns:
+        A tensor of shape (num_positions, embedding_dim)
+    """
+    pe = torch.zeros(num_positions, embedding_dim)
+    position = torch.arange(0, num_positions, dtype=torch.float).unsqueeze(1)
+    
+    # Calculate the frequency divisor
+    div_term = torch.exp(torch.arange(0, embedding_dim, 2).float() * (-math.log(10000.0) / embedding_dim))
+    
+    # Apply sine to even indices, cosine to odd indices
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    
+    return pe
 
 @torch.no_grad()
 def masked_sample(
@@ -139,7 +161,7 @@ def logit_soft_cap(score, b, h, q_idx, kv_idx):
     Applies soft-clipping to attention logits: 
     C * tanh(score / C)
     """
-    cap = 6.0
+    cap = 50.0
     return torch.tanh(score / cap) * cap
 
 # ----------------------------------------
@@ -239,7 +261,7 @@ class FlexReadout(nn.Module):
       1 = critic
 
     Key/value tokens:
-      full 15-token current turn
+      full token current turn
     """
     def __init__(self, d_model, n_heads, ff_expansion=2.0, dropout=0.0):
         super().__init__()
@@ -263,7 +285,7 @@ class FlexReadout(nn.Module):
     def forward(self, q_x: torch.Tensor, kv_x: torch.Tensor) -> torch.Tensor:
         """
         q_x:  [B, 2, D]   actor/critic query tokens
-        kv_x: [B, 15, D]  full current-turn tokens
+        kv_x: [B, :, D]  full current-turn tokens
         """
         B, Q, D = q_x.shape
         K = kv_x.shape[1]
@@ -292,7 +314,8 @@ class PokeTransformer(nn.Module):
         self.meta, self.f_map = meta, meta["feature_map"]
         self.d_model = out_dims["pokemon_vec"]
         self.n_heads, self.n_layers = n_heads, n_layers
-        
+        self.bank_ranges = bank_ranges
+        self.bank_dims = bank_dims
         self.kv_cache_len = kwargs.get("kv_cache_len", 64)
         
         # Identity Embeddings
@@ -305,7 +328,7 @@ class PokeTransformer(nn.Module):
         self.power_emb = nn.Embedding(bank_ranges["power"], bank_dims["power"])
         
         # Subnets
-        self.move_net = self._build_subnet(self._calc_move_in(emb_dims, bank_dims), out_dims["move_vec"])
+        self.move_net = self._build_subnet(self._calc_move_in(emb_dims, bank_dims), self.d_model)
         self.ability_net = self._build_subnet(emb_dims["ability"] * meta["n_ability_slots"], out_dims["ability_vec"])
         self.pokemon_net = self._build_subnet(self._calc_pok_in(emb_dims, bank_dims, out_dims), self.d_model)
         self.field_net = self._build_subnet(
@@ -322,6 +345,7 @@ class PokeTransformer(nn.Module):
         # Decision Tokens
         self.actor_tok = nn.Parameter(torch.randn(1, 1, self.d_model))
         self.critic_tok = nn.Parameter(torch.randn(1, 1, self.d_model))
+        self.register_toks = nn.Parameter(torch.randn(1, 1, self.d_model))
         
         self.transformer = nn.ModuleList([FlexEncoderLayer(self.d_model, n_heads) for _ in range(n_layers)])
         self.readout = FlexReadout(self.d_model, n_heads)
@@ -340,28 +364,80 @@ class PokeTransformer(nn.Module):
             if isinstance(m, (nn.Linear, nn.Embedding)): 
                 nn.init.normal_(m.weight, std=0.02)
                 if hasattr(m, 'bias') and m.bias is not None: nn.init.zeros_(m.bias)
+                
+        self.val_100_emb.weight.data.copy_(
+            get_sinusoidal_encoding(self.bank_ranges["val_100"], self.bank_dims["val_100"])
+        )
+        self.stat_emb.weight.data.copy_(
+            get_sinusoidal_encoding(self.bank_ranges["stat"], self.bank_dims["stat"])
+        )
+        self.power_emb.weight.data.copy_(
+            get_sinusoidal_encoding(self.bank_ranges["power"], self.bank_dims["power"])
+        )
+        
         # Depth-scaled initialization for residual projections
         # Scale by 1 / sqrt(2 * n_layers) because there are 2 residual additions per layer (Attn + FFN)
-        std_proj = 0.02 / (2 * self.n_layers) ** 0.5
+        std_proj = 0.02
+        if self.n_layers > 7:
+            std_proj = 0.02 / (2 * self.n_layers) ** 0.5
         
+        # Override the 0.02 std with Xavier Uniform to ensure Q and K dot products
+        # have enough variance to create sharp attention distributions.
+        d = self.d_model
         for layer in self.transformer:
-            # Scale the Attention output projection
+            # Slice the fused QKV matrix to initialize Q, K, and V correctly
+            with torch.no_grad():
+                # QK gets Xavier
+                nn.init.xavier_uniform_(layer.qkv_proj.weight[:2*d, :], gain=1.0)
+                # V gets standard low-variance pipeline init
+                nn.init.normal_(layer.qkv_proj.weight[2*d:, :], std=0.02)
+                
             nn.init.normal_(layer.out_proj.weight, std=std_proj)
-            # Scale the final FFN linear layer (which is at index 2 in your nn.Sequential)
             nn.init.normal_(layer.ff[2].weight, std=std_proj)
             
-        # Also scale the Readout module's residual projections
+        # 3. Apply Spiky Init to the Readout Cross-Attention
+        nn.init.xavier_uniform_(self.readout.q_proj.weight, gain=1.5)
+        nn.init.xavier_uniform_(self.readout.k_proj.weight, gain=1.5)
+        # Keep V projection and residuals standard
+        nn.init.normal_(self.readout.v_proj.weight, std=0.02)
         nn.init.normal_(self.readout.out_proj.weight, std=std_proj)
         nn.init.normal_(self.readout.ff[2].weight, std=std_proj)
 
+        # 4. Ensure decision tokens start small so they don't drown out the board
+        nn.init.normal_(self.actor_tok, std=0.02)
+        nn.init.normal_(self.critic_tok, std=0.02)
+        nn.init.normal_(self.register_toks, std=0.02)
+
     def _calc_move_in(self, emb, bank):
         m = self.f_map["move"]
-        return emb["move"] + (bank["val_100"] * 2) + bank["power"] + (m["target_raw"][1] - m["onehots_raw"][0])
+        # Use flags_end to include the new STAB, Status, and Identity dimensions
+        return emb["move"] + (bank["val_100"] * 2) + bank["power"] + (m["flags_end"] - m["onehots_raw"][0])
 
     def _calc_pok_in(self, emb, bank, out):
+        """Dynamically calculates the Pokemon Net input dimension from metadata."""
         b = self.f_map["body"]
-        raw_body_slice_len = (b["boosts_raw"][1] - b["boosts_raw"][0]) + (self.meta["dim_pokemon_body"] - b["flags_raw"][0])
-        return (emb["pokemon"] + emb["item"] + bank["val_100"] * 2 + bank["stat"] * 8 + out["ability_vec"] + (4 * out["move_vec"]) + raw_body_slice_len)
+        
+        # 1. Categorical ID Dimensions (Species + Item)
+        id_dims = emb["pokemon"] + emb["item"]
+        
+        # 2. Bank Embedding Dimensions
+        # HP (1) and Level (1) use val_100 bank
+        # Combat Stats (15) and Weight/Height (2) use stat bank
+        stat_slice_len = b["stats_int"][1] - b["stats_int"][0]
+        phys_slice_len = (b["height_int"] + 1) - b["weight_int"] # Weight and Height indices
+        
+        bank_dims = (bank["val_100"] * 2) + (bank["stat"] * (stat_slice_len + phys_slice_len))
+        
+        # 3. Subnet Output Dimensions (Ability Vec)
+        subnet_dims = out["ability_vec"]
+        
+        # 4. Raw Float Slices (Non-Embedded)
+        # Slice 1: The Boosts block (91 floats)
+        # Slice 2: Flags, Mechanics, Types, Effects, Status, Gender, and Slot ID (Rest of the buffer)
+        raw_boost_len = b["boosts_raw"][1] - b["boosts_raw"][0]
+        raw_tail_len = self.meta["dim_pokemon_body"] - b["flags_raw"][0]
+        
+        return id_dims + bank_dims + subnet_dims + raw_boost_len + raw_tail_len
     
     def enable_bf16_recurrent_path(self):
         bf16_modules = [
@@ -387,59 +463,61 @@ class PokeTransformer(nn.Module):
     
         self.actor_tok.data = self.actor_tok.data.bfloat16()
         self.critic_tok.data = self.critic_tok.data.bfloat16()
+        self.register_toks.data = self.register_toks.data.bfloat16()
     
     def recurrent_dtype(self) -> torch.dtype:
         return self.actor_tok.dtype
         
     def encode_features(self, obs_flat):
-        """Vectorized feature extraction for Field and Pokemon."""
         obs = self.unpacker(obs_flat)
         B = obs_flat.shape[0]
         rec_dtype = self.recurrent_dtype()
-        
-        # Moves -> Ability -> Pokemon
+        b_map = self.f_map["body"]
+        m_map = self.f_map["move"]
+
+        # --- MOVE ENCODING ---
         m_sc = obs["move_scalars"]
         m_combined = torch.cat([
             self.move_emb(obs["move_ids"]),
-            self.val_100_emb(m_sc[..., self.f_map["move"]["acc_int"]].long()),
-            self.power_emb(m_sc[..., self.f_map["move"]["pwr_int"]].long()),
-            self.val_100_emb(m_sc[..., self.f_map["move"]["pp_int"]].long()),
-            # UPDATED: Replaced type_raw with target_raw to include Category and Target
-            m_sc[..., self.f_map["move"]["onehots_raw"][0] : self.f_map["move"]["target_raw"][1]].to(rec_dtype)
+            self.val_100_emb(m_sc[..., m_map["acc_int"]].long()),
+            self.power_emb(m_sc[..., m_map["pwr_int"]].long()),
+            self.val_100_emb(m_sc[..., m_map["pp_int"]].long()),
+            m_sc[..., m_map["onehots_raw"][0] : m_map["flags_end"]].to(rec_dtype)
         ], dim=-1)
-        m_vecs = self.move_net(m_combined.view(-1, m_combined.shape[-1])).view(B, 12, -1)
+        m_vecs = self.move_net(m_combined.view(-1, m_combined.shape[-1])).view(B, 48, -1)
+
+        # --- ABILITY ENCODING ---
         a_vecs = self.ability_net(self.ability_emb(obs["ability_ids"]).view(B, 12, -1))
 
+        # --- POKEMON ENCODING ---
         p_body = obs["pokemon_body"]
         p_in = torch.cat([
-            self.pokemon_id_emb(obs["pokemon_ids"][:, :, 0]),
-            self.item_emb(obs["pokemon_ids"][:, :, 1]),
-            self.val_100_emb(p_body[:, :, self.f_map["body"]["hp_int"]].long()),
-            self.stat_emb(p_body[:, :, self.f_map["body"]["stats_int"][0] : self.f_map["body"]["stats_int"][1]].long()).flatten(2),
-            self.val_100_emb(p_body[:, :, self.f_map["body"]["level_int"]].long()),
-            self.stat_emb(p_body[:, :, self.f_map["body"]["weight_int"] : self.f_map["body"]["weight_int"]+2].long()).flatten(2),
-            a_vecs, m_vecs,
-            p_body[:, :, self.f_map["body"]["boosts_raw"][0] : self.f_map["body"]["boosts_raw"][1]].to(rec_dtype),
-            p_body[:, :, self.f_map["body"]["flags_raw"][0] : ].to(rec_dtype)
+            self.pokemon_id_emb(obs["pokemon_ids"][:, :, 0]), # Species
+            self.item_emb(obs["pokemon_ids"][:, :, 1]),       # Item
+            self.val_100_emb(p_body[:, :, b_map["hp_int"]].long()), # HP %
+            self.stat_emb(p_body[:, :, b_map["stats_int"][0] : b_map["stats_int"][1]].long()).flatten(2), # Stats
+            self.val_100_emb(p_body[:, :, b_map["level_int"]].long()), # Level
+            self.stat_emb(p_body[:, :, b_map["weight_int"] : b_map["height_int"] + 1].long()).flatten(2), # W/H
+            a_vecs, # Ability Subnet Result
+            p_body[:, :, b_map["boosts_raw"][0] : b_map["boosts_raw"][1]].to(rec_dtype), # Raw Boosts
+            p_body[:, :, b_map["flags_raw"][0] : ].to(rec_dtype) # Flags, Types, Status, Identity
         ], dim=-1)
         p_tokens = self.pokemon_net(p_in.view(-1, p_in.shape[-1])).view(B, 12, -1)
 
+        # --- FIELD ENCODING ---
         field_in = torch.cat([
-            self.power_emb(
-                obs["global_scalars"][:, self.f_map["global"]["turn_int"]].long()
-            ),
+            self.power_emb(obs["global_scalars"][:, self.f_map["global"]["turn_int"]].long()),
             obs["global_scalars"][:, self.f_map["global"]["remainder_raw"][0]:].to(rec_dtype),
-        
             self.move_emb(obs["transition_move_ids"]).view(B, -1),
             self.pokemon_id_emb(obs["transition_pokemon_ids"]).view(B, -1),
             self.ability_emb(obs["transition_ability_ids"]).view(B, -1),
             self.item_emb(obs["transition_item_ids"]).view(B, -1),
-        
             obs["transition_scalars"].to(rec_dtype),
             obs["action_mask"].to(rec_dtype),
         ], dim=-1)
         field_token = self.field_net(field_in).unsqueeze(1)
-        return field_token, p_tokens
+
+        return field_token, p_tokens, m_vecs
 
     def forward(self, obs_flat: torch.Tensor, 
                 episode_ids: torch.Tensor = None, 
@@ -450,14 +528,16 @@ class PokeTransformer(nn.Module):
         device = obs_flat.device
         K = self.kv_cache_len
         
-        field_tok, p_toks = self.encode_features(obs_flat)
+        field_tok, p_toks, m_toks = self.encode_features(obs_flat)
         
         current_turn = torch.cat([
                 field_tok,                          # 0
                 p_toks,                             # 1-12
-                self.actor_tok.expand(B, 1, -1),    # 13
-                self.critic_tok.expand(B, 1, -1),   # 14
-            ], dim=1)  # [B, 15, D]
+                m_toks,                             # 13-60 (48 Moves)
+                self.register_toks.expand(B, 1, -1),
+                self.actor_tok.expand(B, 1, -1),    # 61
+                self.critic_tok.expand(B, 1, -1),   # 62
+            ], dim=1)  # [B, 63, D]
 
         # --- PACKED TRAINING MODE ---
         if episode_ids is not None:
@@ -690,6 +770,40 @@ def gae_from_episode(
     ret = adv + values
     return adv, ret
 
+def masked_smoothed_cross_entropy(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor, smoothing: float = 0.1) -> torch.Tensor:
+    """
+    Computes cross-entropy loss with label smoothing applied ONLY to legal actions.
+    Illegal actions are forced to 0.0 probability in the target distribution.
+    """
+    # 0. SAFETY VALVE: Guarantee the target action is always unmasked.
+    # If the heuristic bot took an action that our obs mask thinks is illegal,
+    # we must forcefully unmask it so the loss doesn't explode.
+    target_idx = targets.unsqueeze(1).to(torch.int64)
+    mask = mask.clone()  # Clone so we don't mutate the raw batch data
+    mask.scatter_(1, target_idx, 1.0)
+    
+    # 1. Force the mask to match the logits dtype to prevent promotion mismatches
+    mask = mask.to(logits.dtype)
+    
+    ml = masked_logits(logits, mask)
+    log_probs = F.log_softmax(ml, dim=-1)
+    
+    with torch.no_grad():
+        legal_counts = mask.sum(dim=-1, keepdim=True)
+        smooth_prob = smoothing / legal_counts
+        target_dist = mask * smooth_prob
+        
+        # 2. Force confidence_mass to dynamically match the target_dist dtype
+        confidence_mass = torch.full_like(targets.unsqueeze(1), 1.0 - smoothing, dtype=logits.dtype)
+        
+        # 3. Force targets to int64, as scatter_add_ requires index tensors to be LongTensors
+        target_idx = targets.unsqueeze(1).to(torch.int64)
+        
+        target_dist.scatter_add_(1, target_idx, confidence_mass)
+
+    loss = -(target_dist * log_probs).sum(dim=-1).mean()
+    return loss
+
 def ppo_update(
     net: nn.Module,
     opt: optim.Optimizer,
@@ -728,12 +842,17 @@ def ppo_update(
                                          )
 
             if mode == "imitation":
-                pg_loss = nn.functional.cross_entropy(logits.float(), mb_act, label_smoothing=0.1)
+                pg_loss = masked_smoothed_cross_entropy(
+                    logits=logits.float(), 
+                    targets=mb_act, 
+                    mask=mb_mask, 
+                    smoothing=0.1
+                )
                 ent_loss = approx_kl = clip_frac = torch.tensor(0.0, device=dev)
                 
                 target_dist = twohot_targets(mb_ret, v_min=cfg["v_min"], v_max=cfg["v_max"], v_bins=cfg["v_bins"])
                 v_loss = dist_value_loss(v_logits, target_dist)
-                loss = pg_loss + v_loss
+                loss = pg_loss + (cfg.get("vf_coef", 0.5) * v_loss)
             elif mode == "warmup":
                 target_dist = twohot_targets(mb_ret, v_min=cfg["v_min"], v_max=cfg["v_max"], v_bins=cfg["v_bins"])
                 loss = dist_value_loss(v_logits, target_dist)

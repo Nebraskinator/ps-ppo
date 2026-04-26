@@ -39,6 +39,41 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # MONKEY PATCHES & SYSTEM FIXES
 # ---------------------------------------------------------------------------
+
+import math
+
+def _corrected_stat_estimation(mon, stat: str) -> float:
+    """
+    A mathematically accurate stat estimator for Gen 9 Random Battles.
+    Replaces the hallucinated Level 100 / 0 EV logic in the original bot.
+    """
+    # 1. FIX THE BOOST MULTIPLIER
+    # Original bug checked `> 1` which made +1 act like +0, and +2 act like +2.
+    boost_lvl = mon.boosts.get(stat, 0)
+    if boost_lvl > 0:
+        boost_mult = (2 + boost_lvl) / 2  # e.g., +1 = 1.5x
+    else:
+        boost_mult = 2 / (2 - boost_lvl)  # e.g., -1 = 0.66x
+
+    # 2. APPLY TRUE GEN 9 RANDBATS MATH
+    base = mon.base_stats[stat]
+    level = mon.level
+    
+    # Gen 9 RandBats assigns a flat 85 EVs to every stat
+    ev = 85 
+    
+    # We assume 31 IVs (ignoring the 0 Speed Trick Room edge case for simplicity)
+    iv = 31 
+    
+    # Standard Pokémon non-HP stat formula
+    raw_stat = math.floor(((2 * base + iv + math.floor(ev / 4)) * level) / 100) + 5
+    
+    # Apply boosts
+    return raw_stat * boost_mult
+
+# Apply the Monkey Patch
+SimpleHeuristicsPlayer._stat_estimation = _corrected_stat_estimation
+
 _original_handle_message = poke_env.ps_client.PSClient._handle_message
 
 def _apply_patches():

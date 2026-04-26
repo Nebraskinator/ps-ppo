@@ -151,6 +151,9 @@ def _add_stat_delta(buffer: Any, base: int, stat_name: str, delta: float) -> Non
         buffer[base + FLAG_DIM + j] += float(delta) / 6.0
 
 def _mark_source_flags(buffer: Any, base: int, tags: Dict[str, Any]) -> None:
+    if tags.get("fromitem"):
+        _set_flag(buffer, base, IDX_FROM_ITEM)
+        
     src = tags.get("from") or tags.get("source")
     if not isinstance(src, str): return
     s = src.strip().lower()

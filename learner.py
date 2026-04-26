@@ -92,13 +92,14 @@ class LearnerActor:
 
         if self.cfg.mode == "imitation":
             for name, p in self.net.named_parameters():
-                if name.startswith("v_head.") or "critic_tok" in name:
-                    p.requires_grad = False
+                pass
+                #if name.startswith("v_head."):
+                #    p.requires_grad = False
         elif self.cfg.mode == "warmup":
             for p in self.net.parameters():
                 p.requires_grad = False
             for name, p in self.net.named_parameters():
-                if name.startswith("v_head.") or "critic_tok" in name:
+                if name.startswith("v_head."):
                     p.requires_grad = True
 
         # 1. Topology-aware grouping

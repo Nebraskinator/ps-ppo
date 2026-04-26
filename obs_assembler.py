@@ -78,9 +78,8 @@ class ObservationAssembler:
             curr += size
         self.meta["offsets"] = self.offsets
         self.total_dim = curr
-        # Using float16 for memory efficiency during rollout
         self.calc_buf = np.zeros(self.total_dim, dtype=np.float16)
-
+        
     def _load_vocab(self, path: str) -> Dict[str, List[str]]:
         """Loads and validates the vocabulary file."""
         if not os.path.exists(path):
@@ -120,12 +119,17 @@ class ObservationAssembler:
             # Encode categorical IDs (Species, Item, Ability)
             encode_ability_inplace(mon, self.calc_buf, i, off, self.vocab_map)
             
+            # Encode categorical IDs (Species, Item, Ability)
+            available_move_ids = []
+            if is_self and mon and mon.active and battle.available_moves:
+                available_move_ids = [m.id for m in battle.available_moves]
+                
             # Encode individual move properties
-            target_team = opp_team if is_self else self_team
             encode_moves_inplace(
                 mon, self.calc_buf, i, self.move_scalar_dim, 
                 off, self.vocab_map, self.vocab_lists,
-                opponent_team=target_team
+                is_self=is_self, # Pass the boolean directly
+                available_move_ids=available_move_ids
             )
 
         # 2. ENCODE GLOBAL STATE (Weather, Terrain, Hazards)
@@ -240,11 +244,9 @@ class ObservationAssembler:
         """Reverse-maps a 0.15 BattleOrder to a policy index (used for Imitation Learning)."""
         if not order:
             return 0 # Handle string/DEFAULT orders
-            
         choice = getattr(order, "order", None)
         if not choice:
             return 0
-            
         # Case A: Move/Tera (0.15 exposes Move objects)
         if hasattr(choice, "id"):  # Safer check than base_power
             active_mon = battle.active_pokemon
@@ -271,79 +273,40 @@ class ObservationAssembler:
 
     @staticmethod
     def get_schema_metadata(vocab_lists: Dict[str, List[str]]=None) -> Dict[str, Any]:
-        """
-        Generates schema offsets to remove magic numbers from model architecture.
-        """
         if vocab_lists is None:
             with open("vocab.json", "r") as f:
                 vocab_lists = json.load(f)
-                
+        from obs_moves import get_move_metadata
+        from obs_pokemon import get_pokemon_metadata
+        move_meta = get_move_metadata(vocab_lists)
+        pok_meta = get_pokemon_metadata(vocab_lists)
+        
         v_type = len(vocab_lists.get("pokemon.type", [])) + 1
-        v_effect = len(vocab_lists.get("pokemon.effect", [])) + 1
-        v_status = len(vocab_lists.get("pokemon.status", [])) + 1
-        v_gender = len(vocab_lists.get("pokemon.gender", [])) + 1
         
-        # Pokemon Body Mapping
-        body_map = {
-            "hp_int": 0,
-            "stats_int": (1, 7),
-            "boosts_raw": (7, 98),
-            "level_int": 98,
-            "weight_int": 99,
-            "height_int": 100,
-            "flags_raw": (101, 113),
-            "types_raw": (113, 113 + (v_type * 2)),
-            "effects_raw": (113 + (v_type * 2), 113 + (v_type * 2) + v_effect),
-            "status_raw": (113 + (v_type * 2) + v_effect, 113 + (v_type * 2) + v_effect + v_status),
-            "gender_raw": (113 + (v_type * 2) + v_effect + v_status, 113 + (v_type * 2) + v_effect + v_status + v_gender),
-            "pos_raw": (-12, None)
-        }
-        dim_pokemon_body = 113 + (v_type * 2) + v_effect + v_status + v_gender + 12
-
-        # Move Map
-        v_move_cat = len(vocab_lists.get("move.category", [])) + 1
-        v_move_target = len(vocab_lists.get("move.target", [])) + 1
-        
-        move_map = {
-            "acc_int": 0, "pwr_int": 1, "pp_int": 2,
-            "onehots_raw": (3, 19), 
-            "type_raw": (19, 19 + v_type),
-            "category_raw": (19 + v_type, 19 + v_type + v_move_cat),
-            "target_raw": (19 + v_type + v_move_cat, 19 + v_type + v_move_cat + v_move_target)
-        }
-        dim_move_scalars = (19 + v_type + v_move_cat + v_move_target) * 4
-        
-        weather_len = len(vocab_lists.get("global.weather", [])) + 1 + 10
-        field_len = len(vocab_lists.get("global.field", [])) + 1 
-        side_len = len(vocab_lists.get("global.side_condition", [])) + 1
-
         return {
-            "dim_pokemon_body": dim_pokemon_body,
-            "dim_move_scalars": dim_move_scalars,
+            "dim_pokemon_body": pok_meta["scalar_dim"],
+            "dim_move_scalars": move_meta["single_move_dim"] * 4,
             "dim_transition_ids": transition_id_dim(),
             "dim_transition_scalars": transition_scalar_dim(),
-            "dim_global_scalars": 3 + weather_len + field_len + (side_len * 2),
-            "feature_map": {"body": body_map, 
-                            "move": move_map, 
-                            "global": {"turn_int": 0, 
-                                       "remainder_raw": (1, None)},
-                            "transition": {
-                                "move_ids": (0, 2),
-                                "pokemon_ids": (2, 6),
-                                "ability_ids": (6, 8),
-                                "item_ids": (8, 10),
-                                },
-                            },
-            "faint_internal_idx": 101 + 1,
+            "dim_global_scalars": 3 + (len(vocab_lists.get("global.weather", [])) + 1 + 10) + 
+                                  (len(vocab_lists.get("global.field", [])) + 1) + 
+                                  ((len(vocab_lists.get("global.side_condition", [])) + 1) * 2),
+            "feature_map": {
+                "body": pok_meta["feature_map"],
+                "move": move_meta["feature_map"],
+                "global": {"turn_int": 0, "remainder_raw": (1, None)},
+                "transition": {
+                    "move_ids": (0, 2), "pokemon_ids": (2, 6), "ability_ids": (6, 8), "item_ids": (8, 10),
+                },
+            },
+            "faint_internal_idx": pok_meta["faint_internal_idx"], # Index 113
             "vocab_pokemon": len(vocab_lists.get("pokemon.species", [])) + 1,
             "vocab_item": len(vocab_lists.get("pokemon.item", [])) + 1,
             "vocab_ability": len(vocab_lists.get("pokemon.ability", [])) + 1,
             "vocab_move": len(vocab_lists.get("move.id", [])) + 1,
             "vocab_type": v_type,
             "action_dim": 14,
-            "n_pokemon_slots": 12,
-            "n_move_slots": 4,
-            "n_ability_slots": 4,
+            "n_pokemon_slots": 12, "n_move_slots": 4, "n_ability_slots": 4,
             "n_transition_ids": transition_id_dim(),
         }
     
