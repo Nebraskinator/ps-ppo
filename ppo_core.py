@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Tuple, Dict, Optional, Iterator, Final
+from typing import Tuple, Dict, Optional, Iterator, Final, List
 
 import torch
 import torch.nn as nn
@@ -347,6 +347,14 @@ class PokeTransformer(nn.Module):
         self.critic_tok = nn.Parameter(torch.randn(1, 1, self.d_model))
         self.register_toks = nn.Parameter(torch.randn(1, 1, self.d_model))
         
+        self.action_emb = nn.Embedding(meta["action_dim"], self.d_model)
+        # The single shared MLP informational bottleneck
+        self.jepa_predictor = nn.Sequential(
+            nn.Linear(self.d_model * 2, self.d_model * 2),
+            nn.GELU(),
+            nn.Linear(self.d_model * 2, self.d_model)
+        )
+        
         self.transformer = nn.ModuleList([FlexEncoderLayer(self.d_model, n_heads) for _ in range(n_layers)])
         self.readout = FlexReadout(self.d_model, n_heads)
 
@@ -388,7 +396,7 @@ class PokeTransformer(nn.Module):
             # Slice the fused QKV matrix to initialize Q, K, and V correctly
             with torch.no_grad():
                 # QK gets Xavier
-                nn.init.xavier_uniform_(layer.qkv_proj.weight[:2*d, :], gain=1.0)
+                nn.init.xavier_uniform_(layer.qkv_proj.weight[:2*d, :])
                 # V gets standard low-variance pipeline init
                 nn.init.normal_(layer.qkv_proj.weight[2*d:, :], std=0.02)
                 
@@ -438,6 +446,35 @@ class PokeTransformer(nn.Module):
         raw_tail_len = self.meta["dim_pokemon_body"] - b["flags_raw"][0]
         
         return id_dims + bank_dims + subnet_dims + raw_boost_len + raw_tail_len
+    
+    def get_parameter_zones(self) -> Dict[str, List[Tuple[str, nn.Parameter]]]:
+        """
+        Categorizes model parameters into logical zones for the Learner to govern 
+        gradients and learning rates depending on the training phase.
+        """
+        zones = {
+            "embeddings": [], "subnets": [], "transformer": [], 
+            "jepa": [], "readout": [], "pi": [], "v": []
+        }
+        for name, p in self.named_parameters():
+            if name.startswith("pi_head"):
+                zones["pi"].append((name, p))
+            elif name.startswith("v_head"):
+                zones["v"].append((name, p))
+            elif name.startswith("readout"):
+                zones["readout"].append((name, p))
+            elif name.startswith("action_emb") or name.startswith("jepa_predictor"):
+                zones["jepa"].append((name, p))
+            elif "transformer" in name or "actor_tok" in name or "critic_tok" in name or "register_toks" in name:
+                zones["transformer"].append((name, p))
+            elif name.endswith("_emb.weight"):
+                zones["embeddings"].append((name, p))
+            elif "net" in name: # move_net, ability_net, pokemon_net, field_net
+                zones["subnets"].append((name, p))
+            else:
+                # Safe Catch-all
+                zones["transformer"].append((name, p))
+        return zones
     
     def enable_bf16_recurrent_path(self):
         bf16_modules = [
@@ -518,17 +555,12 @@ class PokeTransformer(nn.Module):
         field_token = self.field_net(field_in).unsqueeze(1)
 
         return field_token, p_tokens, m_vecs
-
-    def forward(self, obs_flat: torch.Tensor, 
-                episode_ids: torch.Tensor = None, 
-                kv_cache: list[torch.Tensor] = None,
-                kv_cache_len: torch.Tensor = None,
-                batch_seq_len: int = 0,):
-        B = obs_flat.shape[0]
-        device = obs_flat.device
+    
+    def condition_tokens(self, field_tok, p_toks, m_toks, episode_ids=None, kv_cache=None, kv_cache_len=None, batch_seq_len=0):
+        """Core Transformer Backbone. Returns fully contextualized tokens (Z_t)."""
+        B = field_tok.shape[0]
+        device = field_tok.device
         K = self.kv_cache_len
-        
-        field_tok, p_toks, m_toks = self.encode_features(obs_flat)
         
         current_turn = torch.cat([
                 field_tok,                          # 0
@@ -548,41 +580,27 @@ class PokeTransformer(nn.Module):
 
             b_mask = create_block_mask(
                 lambda b, h, q, k: pokemon_batched_episodic_mask(b, h, q, k, expanded_ids, K),
-                B=n_seq,
-                H=1,
-                Q_LEN=s_tok,
-                KV_LEN=s_tok,
-                device=device,
+                B=n_seq, H=1, Q_LEN=s_tok, KV_LEN=s_tok, device=device,
             )
 
             for layer in self.transformer: x = layer(x, b_mask)
             turn_x = x.view(n_seq * batch_seq_len, TOKENS_PER_TURN, self.d_model)
-            read_q = turn_x[:, ACTOR_IDX:CRITIC_IDX + 1, :]
-            readout = self.readout(read_q, turn_x)
             
-            pi = self.pi_head(readout[:, 0, :]).float()
-            v  = self.v_head(readout[:, 1, :]).float()
-            v_exp = (torch.softmax(v, dim=-1) * self.v_support).sum(dim=-1)
-            return pi, v, v_exp.float(), None, None
+            return turn_x, None, None
 
         # --- BATCHED INFERENCE MODE ---
         if kv_cache_len is None:
             kv_cache_len = torch.zeros(B, dtype=torch.long, device=device)
         else:
             kv_cache_len = kv_cache_len.to(device=device, dtype=torch.long)
+            
         S = TOKENS_PER_TURN + K
         b_mask = create_block_mask(
-        lambda b, h, q, k: pokemon_inference_mask(
-                    b, h, q, k, kv_cache_len, K
-                ),
-                B=B,
-                H=1,
-                Q_LEN=S,
-                KV_LEN=S,
-                device=device,
-            )
+            lambda b, h, q, k: pokemon_inference_mask(b, h, q, k, kv_cache_len, K),
+            B=B, H=1, Q_LEN=S, KV_LEN=S, device=device,
+        )
         
-        hist_pos = torch.arange(K, device=device).unsqueeze(0)                 # [1, K]
+        hist_pos = torch.arange(K, device=device).unsqueeze(0)                 
         hist_valid = hist_pos >= (K - kv_cache_len.unsqueeze(1)) 
         
         x = current_turn
@@ -590,8 +608,7 @@ class PokeTransformer(nn.Module):
         new_kv_cache_len = torch.clamp(kv_cache_len + 1, max=K)
 
         for i, layer in enumerate(self.transformer):
-            # Cache the INPUT field token for this layer to match packed training semantics
-            cur_field_in = x[:, FIELD_IDX:FIELD_IDX + 1, :]   # [B, 1, D]
+            cur_field_in = x[:, FIELD_IDX:FIELD_IDX + 1, :]   
             
             if kv_cache is not None:
                 hist_fields_L = kv_cache[i].to(device=device, dtype=x.dtype, non_blocking=True)
@@ -599,22 +616,61 @@ class PokeTransformer(nn.Module):
                 hist_fields_L = torch.zeros(B, K, self.d_model, device=device, dtype=x.dtype)
                 
             hist_fields_L = hist_fields_L * hist_valid.unsqueeze(-1).to(x.dtype)
-            # 3. Process
             x_full  = torch.cat([x, hist_fields_L], dim=1)
             x_full  = layer(x_full , b_mask)
             x = x_full[:, :TOKENS_PER_TURN, :]
-            # Update layer cache: right-aligned, keep last K
+            
             updated_hist = torch.cat([hist_fields_L, cur_field_in], dim=1)[:, -K:, :]
             new_kv_cache.append(updated_hist)
         
-        read_q = x[:, ACTOR_IDX:CRITIC_IDX + 1, :]      # [B, 2, D]
-        readout = self.readout(read_q, x)
+        return x, new_kv_cache, new_kv_cache_len
+    
+    def readout_policy(self, Z_t):
+        """Cross-attention readout for PPO outputs."""
+        read_q = Z_t[:, ACTOR_IDX:CRITIC_IDX + 1, :]      # [B, 2, D]
+        readout = self.readout(read_q, Z_t)
         
         pi = self.pi_head(readout[:, 0, :])  # actor
         v  = self.v_head(readout[:, 1, :])   # critic
         v_exp = (torch.softmax(v, dim=-1) * self.v_support).sum(dim=-1)
         
-        return pi.float(), v.float(), v_exp.float(), new_kv_cache, new_kv_cache_len
+        return pi.float(), v.float(), v_exp.float()
+
+    def forward_jepa(self, obs_flat: torch.Tensor, act_t: torch.Tensor, episode_ids: torch.Tensor = None, batch_seq_len: int = 0):
+        """
+        JEPA Pre-training Path. 
+        Returns the predicted latents for t+1 and the true latents at t.
+        """
+        # 1. Standard encoding & backbone conditioning
+        field_tok, p_toks, m_toks = self.encode_features(obs_flat)
+        Z_t, _, _ = self.condition_tokens(field_tok, p_toks, m_toks, episode_ids=episode_ids, batch_seq_len=batch_seq_len)
+        
+        # 2. Action Embedding & Broadcasting
+        a_emb = self.action_emb(act_t)             # [B, D]
+        a_broadcast = a_emb.unsqueeze(1).expand(-1, 13, -1) # Broadcast to Field + 12 Pokemon
+        
+        # 3. Slice the state facets we want to predict (0 through 12)
+        state_facets_t = Z_t[:, 0:13, :]           # [B, 13, D]
+        
+        # 4. Concatenate and pass through the bottleneck MLP
+        pred_input = torch.cat([state_facets_t, a_broadcast], dim=-1) # [B, 13, 2D]
+        Z_pred = self.jepa_predictor(pred_input)   # [B, 13, D]
+        
+        return Z_pred, Z_t
+
+    def forward(self, obs_flat: torch.Tensor, episode_ids: torch.Tensor = None, kv_cache: list[torch.Tensor] = None, kv_cache_len: torch.Tensor = None, batch_seq_len: int = 0):
+        """Standard Inference / PPO Path."""
+        field_tok, p_toks, m_toks = self.encode_features(obs_flat)
+        Z_t, new_kv_cache, new_kv_cache_len = self.condition_tokens(
+            field_tok, p_toks, m_toks, episode_ids, kv_cache, kv_cache_len, batch_seq_len
+        )
+        
+        pi, v, v_exp = self.readout_policy(Z_t)
+        
+        if episode_ids is not None:
+            return pi, v, v_exp, None, None
+            
+        return pi, v, v_exp, new_kv_cache, new_kv_cache_len
     
 class ObservationUnpacker(nn.Module):
     """
@@ -754,19 +810,49 @@ def gae_from_episode(
     gamma: float,
     lam: float,
     last_value: float = 0.0,   # terminal -> 0
+    variances: Optional[torch.Tensor] = None, # [T] State-conditional variance
+    lam_min: float = 0.55,
+    lam_max: float = 0.95,
+    lam_eps: float = 1e-8
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Computes GAE for one episode.
+    Computes GAE for one episode. If variances are provided, computes state-aware 
+    dynamic lambda per timestep to balance bias and variance dynamically.
     """
     T = rewards.shape[0]
     adv = torch.zeros((T,), device=rewards.device)
     gae = torch.tensor(0.0, device=rewards.device)
-    for t in reversed(range(T)):
-        next_nonterminal = 1.0 - dones[t]
-        next_value = torch.tensor(last_value, device=rewards.device) if (t == T - 1) else values[t + 1]
-        delta = rewards[t] + gamma * next_value * next_nonterminal - values[t]
-        gae = delta + gamma * lam * next_nonterminal * gae
-        adv[t] = gae
+
+    # ---------------------------------------------------------
+    # Branch A: Dynamic Lambda calculation using per-state Variance
+    # ---------------------------------------------------------
+    if variances is not None:
+        # Precompute 1-step TD Errors for the entire episode
+        next_values = torch.cat([values[1:], torch.tensor([last_value], device=values.device)])
+        next_nonterminal = 1.0 - dones
+        
+        deltas = rewards + gamma * next_values * next_nonterminal - values
+        
+        # Vectorized dynamic lambda calculation
+        delta_sq = deltas ** 2
+        dynamic_lambda = delta_sq / (delta_sq + variances + lam_eps)
+        dynamic_lambda = torch.clamp(dynamic_lambda, min=lam_min, max=lam_max)
+
+        for t in reversed(range(T)):
+            gae = deltas[t] + gamma * dynamic_lambda[t] * next_nonterminal[t] * gae
+            adv[t] = gae
+
+    # ---------------------------------------------------------
+    # Branch B: Standard Static GAE
+    # ---------------------------------------------------------
+    else:
+        for t in reversed(range(T)):
+            next_nonterminal = 1.0 - dones[t]
+            next_value = torch.tensor(last_value, device=rewards.device) if (t == T - 1) else values[t + 1]
+            delta = rewards[t] + gamma * next_value * next_nonterminal - values[t]
+            gae = delta + gamma * lam * next_nonterminal * gae
+            adv[t] = gae
+
     ret = adv + values
     return adv, ret
 
@@ -810,6 +896,7 @@ def ppo_update(
     dataset: AsyncEpisodeDataset,
     scheduler=None,
     mode: str = "ppo",
+    target_net: Optional[nn.Module] = None,
     **cfg
 ) -> PPOUpdateStats:
     """
@@ -841,41 +928,69 @@ def ppo_update(
                                          batch_seq_len=cfg["batch_seq_len"],
                                          )
 
-            if mode == "imitation":
-                pg_loss = masked_smoothed_cross_entropy(
-                    logits=logits.float(), 
-                    targets=mb_act, 
-                    mask=mb_mask, 
-                    smoothing=0.1
-                )
-                ent_loss = approx_kl = clip_frac = torch.tensor(0.0, device=dev)
+            # --- 1. SHARED AUXILIARY JEPA CALCULATION ---
+            jepa_loss = torch.tensor(0.0, device=dev)
+            if "jepa" in mode and target_net is not None:
+                Z_pred, _ = net.forward_jepa(mb_obs, mb_act, episode_ids=mb_ep_ids, batch_seq_len=cfg["batch_seq_len"])
+                
+                with torch.no_grad():
+                    f_targ, p_targ, m_targ = target_net.encode_features(mb_obs)
+                    Z_target, _, _ = target_net.condition_tokens(
+                        f_targ, p_targ, m_targ, episode_ids=mb_ep_ids, batch_seq_len=cfg["batch_seq_len"]
+                    )
+                
+                B = mb_obs.shape[0]
+                seq_len = cfg["batch_seq_len"]
+                n_seq = B // seq_len
+                
+                Z_pred_seq = Z_pred.view(n_seq, seq_len, 13, -1)
+                Z_target_seq = Z_target.view(n_seq, seq_len, TOKENS_PER_TURN, -1)
+                
+                active_idx = [0, 1, 7]
+                pred_t = Z_pred_seq[:, :-1, active_idx, :]
+                targ_t1 = Z_target_seq[:, 1:, active_idx, :]
+                
+                ep_ids_seq = mb_ep_ids.view(n_seq, seq_len)
+                valid_trans = (ep_ids_seq[:, :-1] == ep_ids_seq[:, 1:])
+                
+                if valid_trans.any():
+                    jepa_loss = F.smooth_l1_loss(pred_t[valid_trans], targ_t1[valid_trans])
+                else:
+                    jepa_loss = torch.tensor(0.0, device=dev, requires_grad=True)
+
+            # --- 2. PRIMARY LOSS ROUTING ---
+            if mode in ["imitation", "imitation_frozen_backbone", "imitation_with_jepa"]:
+                pg_loss = masked_smoothed_cross_entropy(logits.float(), mb_act, mb_mask, smoothing=0.1)
+                ent_loss = jepa_loss
+                approx_kl = clip_frac = torch.tensor(0.0, device=dev)
                 
                 target_dist = twohot_targets(mb_ret, v_min=cfg["v_min"], v_max=cfg["v_max"], v_bins=cfg["v_bins"])
                 v_loss = dist_value_loss(v_logits, target_dist)
-                loss = pg_loss + (cfg.get("vf_coef", 0.5) * v_loss)
+                
+                loss = pg_loss + (cfg.get("vf_coef", 0.5) * v_loss) + (cfg.get("jepa_coef", 1.0) * jepa_loss)
+
+            elif mode == "jepa_pretraining":
+                v_loss = jepa_loss # Route for logging
+                pg_loss = ent_loss = approx_kl = clip_frac = torch.tensor(0.0, device=dev)
+                loss = jepa_loss
+                
             elif mode == "warmup":
                 target_dist = twohot_targets(mb_ret, v_min=cfg["v_min"], v_max=cfg["v_max"], v_bins=cfg["v_bins"])
-                loss = dist_value_loss(v_logits, target_dist)
-                v_loss = loss; pg_loss = ent_loss = approx_kl = clip_frac = torch.tensor(0.0, device=dev)
-            else:
+                v_loss = dist_value_loss(v_logits, target_dist)
+                loss = v_loss
+                pg_loss = ent_loss = approx_kl = clip_frac = torch.tensor(0.0, device=dev)
+
+            else: # "ppo" or "ppo_with_jepa"
                 logp_game, ent_game = masked_logprob_entropy(logits.float(), mb_mask, mb_act)
-
-                # --- DECOUPLED POLICY GRADIENTS ---
-                # 1. Game Policy Gradient (Safe from memory noise)
                 ratio_game = (logp_game - mb_logp_old).exp()
-                pg_loss_game = torch.max(-mb_adv * ratio_game, -mb_adv * ratio_game.clamp(1-cfg["clip_coef"], 1+cfg["clip_coef"])).mean()
+                pg_loss = torch.max(-mb_adv * ratio_game, -mb_adv * ratio_game.clamp(1-cfg["clip_coef"], 1+cfg["clip_coef"])).mean()
 
-                # Total PG Loss is the sum of independent branches
-                pg_loss = pg_loss_game
-                
                 target_dist = twohot_targets(mb_ret, v_min=cfg["v_min"], v_max=cfg["v_max"], v_bins=cfg["v_bins"])
                 v_loss = dist_value_loss(v_logits, target_dist)
-
                 ent_loss = ent_game.mean()
-                
-                loss = pg_loss + cfg["vf_coef"] * v_loss - (cfg["ent_coef"] * ent_loss)
-                
-                # Track KL and Clip Frac for the Game Action specifically so you can monitor true agent health
+
+                loss = pg_loss + cfg["vf_coef"] * v_loss - (cfg["ent_coef"] * ent_loss) + (cfg.get("jepa_coef", 1.0) * jepa_loss)
+
                 approx_kl = (mb_logp_old - logp_game).mean() 
                 clip_frac = ((ratio_game - 1.0).abs() > cfg["clip_coef"]).float().mean()
                 

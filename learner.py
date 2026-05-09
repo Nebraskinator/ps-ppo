@@ -78,79 +78,86 @@ class LearnerActor:
 
     def _init_optimizer(self):
         """
-        Initializes the optimizer with specialized parameter groups.
-        
-        Implements Weight Decay exclusion for 1D parameters (biases, LayerNorms)
-        and applies specific learning rate multipliers for the Backbone vs. Heads.
+        Initializes the optimizer applying gradients and learning rates 
+        based on the active training mode.
         """
         if self.net is None:
             return
+            
+        zones = self.net.get_parameter_zones()
+        active_grads, lr_mults = self._get_zone_config()
         
-        # Phase-Based Freezing
-        for p in self.net.parameters():
-            p.requires_grad = True
-
-        if self.cfg.mode == "imitation":
-            for name, p in self.net.named_parameters():
-                pass
-                #if name.startswith("v_head."):
-                #    p.requires_grad = False
-        elif self.cfg.mode == "warmup":
-            for p in self.net.parameters():
-                p.requires_grad = False
-            for name, p in self.net.named_parameters():
-                if name.startswith("v_head."):
-                    p.requires_grad = True
-
-        # 1. Topology-aware grouping
-        t_decay, t_no_decay = [], []  # Transformer Trunk
-        s_decay, s_no_decay = [], []  # Feature Subnets
-        pi_decay, pi_no_decay = [], []  # Policy Head
-        v_decay, v_no_decay = [], []  # Value Head
-
+        # 1. APPLY GRADIENT TOGGLES
+        for zone_name, params in zones.items():
+            requires_grad = active_grads[zone_name]
+            for _, p in params:
+                p.requires_grad = requires_grad
+                
+        # 2. BUILD PARAMETER GROUPS WITH WEIGHT DECAY LOGIC
         wd_val = float(getattr(self.cfg, "weight_decay", 0.01))
-
-        for name, p in self.net.named_parameters():
-            if not p.requires_grad:
-                continue
-
-            # Standard Transformer Rule: No decay on LayerNorm, Bias, or Embeddings
-            no_decay_condition = (
-                any(x in name for x in ["_emb", "norm"]) or 
-                name.endswith(".bias") or 
-                p.ndim == 1
-            )
-
-            if "pi_head" in name:
-                pi_no_decay.append(p) if no_decay_condition else pi_decay.append(p)
-            elif "v_head" in name or "critic_tok" in name:
-                v_no_decay.append(p) if no_decay_condition else v_decay.append(p)
-            elif "transformer" in name or "actor_tok" in name:
-                t_no_decay.append(p) if no_decay_condition else t_decay.append(p)
-            else:
-                s_no_decay.append(p) if no_decay_condition else s_decay.append(p)
-
-        # 2. Assign specialized LRs per group
         base_lr = float(self.cfg.lr)
-        lr_back = base_lr * self.cfg.lr_backbone_mult
-        lr_pi = base_lr * self.cfg.lr_pi_mult
-        lr_v = base_lr * self.cfg.lr_v_mult
-
-        param_groups = [
-            {"params": t_decay, "lr": lr_back, "weight_decay": wd_val, "name": "transformer_wd"},
-            {"params": t_no_decay, "lr": lr_back, "weight_decay": 0.0, "name": "transformer_stable"},
-            {"params": s_decay, "lr": lr_back, "weight_decay": wd_val, "name": "subnets_wd"},
-            {"params": s_no_decay, "lr": lr_back, "weight_decay": 0.0, "name": "subnets_stable"},
-            {"params": pi_decay, "lr": lr_pi, "weight_decay": wd_val, "name": "pi_wd"},
-            {"params": pi_no_decay, "lr": lr_pi, "weight_decay": 0.0, "name": "pi_stable"},
-            {"params": v_decay, "lr": lr_v, "weight_decay": wd_val, "name": "v_wd"},
-            {"params": v_no_decay, "lr": lr_v, "weight_decay": 0.0, "name": "v_stable"},
-        ]
-
-        self.opt = optim.AdamW([pg for pg in param_groups if pg["params"]], eps=1e-5)
         
-        # 3. Learning Rate Scheduler (Linear Warmup + Hold + Power Decay)
+        param_groups = []
+        
+        for zone_name, params in zones.items():
+            if not active_grads[zone_name]:
+                continue # Skip frozen zones entirely
+                
+            decay, no_decay = [], []
+            for name, p in params:
+                # Standard Transformer Rule: No decay on LayerNorm, Bias, or 1D tensors
+                no_decay_condition = (any(x in name for x in ["_emb", "norm"]) or name.endswith(".bias") or p.ndim == 1)
+                
+                if no_decay_condition:
+                    no_decay.append(p)
+                else:
+                    decay.append(p)
+                    
+            # Pull the mode-specific multiplier from the grid
+            target_lr = base_lr * lr_mults[zone_name]
+            
+            if decay:
+                param_groups.append({"params": decay, "lr": target_lr, "weight_decay": wd_val, "name": f"{zone_name}_wd"})
+            if no_decay:
+                param_groups.append({"params": no_decay, "lr": target_lr, "weight_decay": 0.0, "name": f"{zone_name}_stable"})
+
+        self.opt = optim.AdamW(param_groups, eps=1e-5)
         self._init_scheduler()
+        
+    def _get_zone_config(self) -> Tuple[Dict[str, bool], Dict[str, float]]:
+        """Returns mode-aware gradient toggles and LR multipliers."""
+        mode = self.cfg.mode
+        
+        # 1. Gradient toggles (True = Unfrozen, False = Frozen)
+        grad_toggles = {
+            "imitation":               {"embeddings": True,  "subnets": True,  "transformer": True,  "jepa": False, "readout": True,  "pi": True,  "v": True},
+            "imitation_with_jepa":     {"embeddings": True,  "subnets": True,  "transformer": True,  "jepa": True, "readout": True,  "pi": True,  "v": True},
+            "imitation_frozen_backbone":{"embeddings": False, "subnets": False, "transformer": False, "jepa": False, "readout": True,  "pi": True,  "v": True},
+            "jepa_pretraining":        {"embeddings": True,  "subnets": True,  "transformer": True,  "jepa": True,  "readout": False, "pi": False, "v": False},
+            "warmup":                  {"embeddings": False, "subnets": False, "transformer": False, "jepa": False, "readout": False, "pi": False, "v": True},
+            "warmup_with_actor_reset": {"embeddings": False, "subnets": False, "transformer": False, "jepa": False, "readout": False, "pi": True,  "v": True},
+            "ppo_frozen_backbone":     {"embeddings": False, "subnets": False, "transformer": False, "jepa": False, "readout": True,  "pi": True,  "v": True},
+            "ppo":                     {"embeddings": True,  "subnets": True,  "transformer": True,  "jepa": False, "readout": True,  "pi": True,  "v": True},
+            "ppo_with_jepa":           {"embeddings": True,  "subnets": True,  "transformer": True,  "jepa": True, "readout": True,  "pi": True,  "v": True},
+        }
+
+        # 2. LR Multipliers (Mode-Aware)
+        lr_mult_configs = {
+            "imitation":               {"embeddings": 1.0, "subnets": 1.0, "transformer": 1.0, "jepa": 0.0, "readout": 1.0, "pi": 1.0, "v": 1.0},
+            "imitation_frozen_backbone":{"embeddings": 0.0, "subnets": 0.0, "transformer": 0.0, "jepa": 0.0, "readout": 1.0, "pi": 1.0, "v": 2.0},
+            "imitation_with_jepa":     {"embeddings": 1.0, "subnets": 1.0, "transformer": 1.0, "jepa": 1.0, "readout": 1.0, "pi": 1.0, "v": 1.0},
+            "jepa_pretraining":        {"embeddings": 1.0, "subnets": 1.0, "transformer": 1.0, "jepa": 1.0, "readout": 0.0, "pi": 0.0, "v": 0.0},
+            "warmup":                  {"embeddings": 0.0, "subnets": 0.0, "transformer": 0.0, "jepa": 0.0, "readout": 0.0, "pi": 0.0, "v": 1.0},
+            "warmup_with_actor_reset": {"embeddings": 0.0, "subnets": 0.0, "transformer": 0.0, "jepa": 0.0, "readout": 0.0, "pi": 1.0, "v": 1.0},
+            "ppo_frozen_backbone":     {"embeddings": 0.0, "subnets": 0.0, "transformer": 0.0, "jepa": 0.0, "readout": 1.0, "pi": 1.0, "v": 2.0},
+            "ppo_with_jepa":           {"embeddings": 0.5, "subnets": 0.5, "transformer": 0.5, "jepa": 1.0, "readout": 1.0, "pi": 1.0, "v": 2.0},
+            "ppo":                     {"embeddings": 0.1, "subnets": 0.1, "transformer": 0.1, "jepa": 0.0, "readout": 1.0, "pi": 1.0, "v": 2.0},
+        }
+
+        if mode not in grad_toggles or mode not in lr_mult_configs:
+            raise ValueError(f"Unknown training mode configured: {mode}")
+
+        return grad_toggles[mode], lr_mult_configs[mode]
 
     def _init_scheduler(self):
         """Sets up the LambdaLR scheduler based on configured warmup and hold steps."""
@@ -193,44 +200,58 @@ class LearnerActor:
         
         while True:
             # item = ("packed", obs, act, logp, val, rew, done, lengths)
-            msg = await self._q.get()
-            if not isinstance(msg, tuple) or msg[0] != "packed":
-                continue
-
-            _, obs_cat, act_cat, logp_cat, val_cat, rew_cat, done_cat, lengths = msg
-            
-            # Convert to CPU Tensors
-            obs_all = torch.from_numpy(obs_cat)
-            act_all = torch.from_numpy(act_cat).long()
-            val_all = torch.from_numpy(val_cat).float()
-            rew_all = torch.from_numpy(rew_cat).float()
-            done_all = torch.from_numpy(done_cat).float()
-
-            # Vectorized GAE Calculation
-            adv_chunks, ret_chunks, id_chunks = [], [], []
-            curr = 0
-            for length in lengths.tolist():
-                end = curr + int(length)
-                adv, ret = gae_from_episode(
-                    rew_all[curr:end], val_all[curr:end], done_all[curr:end],
-                    gamma=self.cfg.gamma, lam=self.cfg.gae_lambda
-                )
-                adv_chunks.append(adv)
-                ret_chunks.append(ret)
-                # Generate matching Episode IDs for this chunk
-                id_chunks.append(torch.full((int(length),), self.ep_counter, dtype=torch.long))
+            msgs = [await self._q.get()]
+            while not self._q.empty():
+                try:
+                    msgs.append(self._q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            for msg in msgs:
+                if not isinstance(msg, tuple) or msg[0] != "packed":
+                    continue
+    
+                _, obs_cat, act_cat, logp_cat, val_cat, var_cat, rew_cat, done_cat, lengths = msg
                 
-                curr = end
-                self.ep_counter += 1 # Increment unique global episode ID
-
-            self.dataset.add_steps(
-                obs_all, act_all, torch.from_numpy(logp_cat), val_all,
-                torch.cat(adv_chunks), torch.cat(ret_chunks), torch.zeros(len(act_all)),
-                torch.cat(id_chunks)
-            )
-            
-            self.total_episodes += len(lengths)
-            self.total_steps += len(act_all)
+                # Convert to CPU Tensors
+                obs_all = torch.from_numpy(obs_cat)
+                act_all = torch.from_numpy(act_cat).long()
+                val_all = torch.from_numpy(val_cat).float()
+                var_all = torch.from_numpy(var_cat).float()
+                rew_all = torch.from_numpy(rew_cat).float()
+                done_all = torch.from_numpy(done_cat).float()
+    
+                # Vectorized GAE Calculation
+                adv_chunks, ret_chunks, id_chunks = [], [], []
+                curr = 0
+                for length in lengths.tolist():
+                    end = curr + int(length)
+                    adv, ret = gae_from_episode(
+                        rewards=rew_all[curr:end], 
+                        values=val_all[curr:end], 
+                        dones=done_all[curr:end],
+                        gamma=self.cfg.gamma, 
+                        lam=self.cfg.gae_lambda,
+                        variances=var_all[curr:end] if self.cfg.use_dynamic_lambda else None,
+                        lam_min=self.cfg.dynamic_lambda_min,
+                        lam_max=self.cfg.dynamic_lambda_max,
+                        lam_eps=self.cfg.dynamic_lambda_eps
+                    )
+                    adv_chunks.append(adv)
+                    ret_chunks.append(ret)
+                    # Generate matching Episode IDs for this chunk
+                    id_chunks.append(torch.full((int(length),), self.ep_counter, dtype=torch.long))
+                    
+                    curr = end
+                    self.ep_counter += 1 # Increment unique global episode ID
+    
+                self.dataset.add_steps(
+                    obs_all, act_all, torch.from_numpy(logp_cat), val_all,
+                    torch.cat(adv_chunks), torch.cat(ret_chunks), torch.zeros(len(act_all)),
+                    torch.cat(id_chunks)
+                )
+                
+                self.total_episodes += len(lengths)
+                self.total_steps += len(act_all)
 
             # Trigger Update
             if len(self.dataset) >= self.cfg.steps_per_update:
@@ -318,9 +339,15 @@ class LearnerActor:
             # 3. PPO Update Step
             stats = ppo_update(
                 net=self.net, opt=self.opt, dataset=train_ds, scheduler=self.sched,
-                mode=self.cfg.mode, **self.cfg.ppo_kwargs(),
+                mode=self.cfg.mode, target_net=getattr(self, "target_net", None), **self.cfg.ppo_kwargs(),
                 v_min=self.cfg.v_min, v_max=self.cfg.v_max, v_bins=self.cfg.v_bins
             )
+            
+            if self.cfg.mode in ("jepa_pretraining", "imitation_with_jepa", "ppo_with_jepa"):
+                tau = float(getattr(self.cfg, "jepa_ema_tau", 0.99))
+                with torch.no_grad():
+                    for param, target_param in zip(self.net.parameters(), self.target_net.parameters()):
+                        target_param.data.mul_(tau).add_(param.data, alpha=1.0 - tau)
 
             self.update_idx += 1
             
@@ -367,11 +394,12 @@ class LearnerActor:
         act_cat: np.ndarray,   # [S]
         logp_cat: np.ndarray,  # [S]
         val_cat: np.ndarray,   # [S]
+        var_cat: np.ndarray,   # [S]
         rew_cat: np.ndarray,   # [S]
         done_cat: np.ndarray,  # [S]
         lengths: np.ndarray,   # [B]
     ):
-        await self._q.put(("packed", obs_cat, act_cat, logp_cat, val_cat, rew_cat, done_cat, lengths))
+        await self._q.put(("packed", obs_cat, act_cat, logp_cat, val_cat, var_cat, rew_cat, done_cat, lengths))
         return True
     
     def _ckpt_path_for_update(self, update_idx: int) -> str:
@@ -381,6 +409,7 @@ class LearnerActor:
         """Serializes model, optimizer, and RNG states to disk."""
         payload = {
             "model": self.net.state_dict(),
+            "target_model": self.target_net.state_dict() if hasattr(self, "target_net") else None,
             "optimizer": self.opt.state_dict(),
             "scheduler": self.sched.state_dict() if self.sched else None,
             "update_idx": self.update_idx,
@@ -399,6 +428,13 @@ class LearnerActor:
             self._enable_compiled_flex_attention()
             self.net = self.run_cfg.make_model().to(self.cfg.device).train()
             self.net.enable_bf16_recurrent_path()
+            
+            self.target_net = self.run_cfg.make_model().to(self.cfg.device).eval()
+            self.target_net.enable_bf16_recurrent_path()
+            self.target_net.load_state_dict(self.net.state_dict())
+            for p in self.target_net.parameters():
+                p.requires_grad = False
+            
             self._init_optimizer()
             
     def _latest_ckpt_path(self) -> Optional[str]:
@@ -451,18 +487,30 @@ class LearnerActor:
         should_reset_opt = (current_mode != ckpt_mode)
         model_weights = {k: v for k, v in ckpt["model"].items() if "attn_mask" not in k}
         
-        # If transitioning from imitation, filter out the dead memory weights
-        # strict=False allows the fresh memory weights to persist
-        #if should_reset_opt and current_mode == "ppo":
-        #    print(f"[learner] 🧹 Scrubbing dead memory weights from {ckpt_mode} checkpoint.")
-        #    model_weights = {k: v for k, v in model_weights.items() if "mem" not in k}
-        #    self.net.load_state_dict(model_weights, strict=False)
-        #else:
-            # FIX: We intentionally scrubbed attn_mask, so strict must be False
+        # FIX: We intentionally scrubbed attn_mask, so strict must be False
         self.net.load_state_dict(model_weights, strict=False)
+        
+        if hasattr(self, "target_net"):
+            if "target_model" in ckpt and ckpt["target_model"] is not None:
+                # Same scrubbing logic for the target net
+                target_weights = {k: v for k, v in ckpt["target_model"].items() if "attn_mask" not in k}
+                self.target_net.load_state_dict(target_weights, strict=False)
+                print("[learner] Loaded target network EMA state from checkpoint.")
+            else:
+                self.target_net.load_state_dict(self.net.state_dict())
+                print("[learner] No target network in ckpt. Synced target_net to main net.")
 
         if should_reset_opt:
             print(f"[learner] 🛑 PHASE CHANGE DETECTED ({ckpt_mode} -> {current_mode}).")
+            
+            # --- Reinitialize actor head weights on warmup ---
+            if current_mode == "warmup_with_actor_reset":
+                print("[learner] 🧹 Resetting actor head parameters for warmup phase.")
+                if hasattr(self.net, "pi_head"):
+                    nn.init.normal_(self.net.pi_head.weight, std=0.02)
+                    if hasattr(self.net.pi_head, "bias") and self.net.pi_head.bias is not None:
+                        nn.init.zeros_(self.net.pi_head.bias)
+                        
             print(f"[learner] 🧹 SKIPPING Optimizer/Scheduler load to enforce fresh LR.")
             
             # We treat this as a fresh start, just with pre-trained weights.
@@ -486,28 +534,20 @@ class LearnerActor:
                 except:
                     pass
 
-            # 2. APPLY OVERRIDE AFTERWARD
+            # 2. APPLY OVERRIDE AFTERWARD (Updated for Dynamic Parameter Zones)
             try:
                 new_base_lr = float(self.cfg.lr)
-                mults = {
-                    "pi": float(getattr(self.cfg, "lr_pi_mult", 1.0)),
-                    "v": float(getattr(self.cfg, "lr_v_mult", 1.0)),
-                    "backbone": float(getattr(self.cfg, "lr_backbone_mult", 1.0))
-                }
+                active_grads, lr_mults = self._get_zone_config()
 
                 for pg in self.opt.param_groups:
                     group_name = pg.get("name", "")
-                    if group_name.startswith("pi"):
-                        target_lr = new_base_lr * mults["pi"]
-                    elif group_name.startswith("v"):
-                        target_lr = new_base_lr * mults["v"]
-                    elif group_name.startswith("transformer") or group_name.startswith("subnets"):
-                        target_lr = new_base_lr * mults["backbone"]
-                    else:
-                        continue
+                    zone = group_name.split("_")[0] 
                     
-                    pg["lr"] = target_lr
-                    pg["initial_lr"] = target_lr  # Updates the baseline for the LambdaLR
+                    # Only apply LR jump if the zone exists and is active in the current mode
+                    if zone in lr_mults and active_grads.get(zone, False):
+                        target_lr = new_base_lr * lr_mults[zone]
+                        pg["lr"] = target_lr
+                        pg["initial_lr"] = target_lr  # Updates the baseline for the LambdaLR
                 
                 # 3. CRITICAL: Force the scheduler to accept the new baselines
                 if self.sched is not None:
@@ -516,14 +556,13 @@ class LearnerActor:
                 try:
                     new_wd = float(getattr(self.cfg, "weight_decay", 0.01))
                     for pg in self.opt.param_groups:
-                        # Only apply to groups that were originally intended to have decay
                         if pg["weight_decay"] > 0:
                             pg["weight_decay"] = new_wd
                     print(f"[learner] ⚡ Weight Decay Override: Updated to {new_wd}")
                 except Exception as e:
                     print(f"[learner] Weight Decay override failed: {e!r}")
                 
-                print(f"[learner] ⚡ LR Jump: Backbone/Subnets={new_base_lr*mults['backbone']:.2g}, Pi={new_base_lr*mults['pi']:.2g}, V={new_base_lr*mults['v']:.2g}")
+                print(f"[learner] ⚡ LR Jump Applied Dynamically Across Zones. Base LR={new_base_lr:.2g}")
             except Exception as e:
                 print(f"[learner] LR Jump override failed: {e!r}")
 

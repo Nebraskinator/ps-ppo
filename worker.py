@@ -9,6 +9,7 @@ GPU Inference Actor via zero-copy Ray RPCs.
 
 from __future__ import annotations
 
+import random
 import asyncio
 import functools
 import logging
@@ -153,7 +154,7 @@ class SyncLearnerClient:
         threading.Thread(target=self._worker, daemon=True).start()
 
     def submit_episode(self, obs: np.ndarray, act: np.ndarray, logp: np.ndarray, 
-                       val: np.ndarray, rew: np.ndarray, done: np.ndarray) -> bool:
+                       val: np.ndarray, var: np.ndarray, rew: np.ndarray, done: np.ndarray) -> bool:
         # If the queue is full, evict the oldest trajectory
         if self.q.full():
             try:
@@ -162,7 +163,7 @@ class SyncLearnerClient:
                 pass
                 
         # Now there is guaranteed room for the absolute newest data
-        self.q.put_nowait((obs, act, logp, val, rew, done))
+        self.q.put_nowait((obs, act, logp, val, var, rew, done))
         return True
 
     def _worker(self):
@@ -186,8 +187,9 @@ class SyncLearnerClient:
             np.concatenate([it[1] for it in items], axis=0).astype(np.int64),
             np.concatenate([it[2] for it in items], axis=0).astype(np.float32),
             np.concatenate([it[3] for it in items], axis=0).astype(np.float32),
-            np.concatenate([it[4] for it in items], axis=0).astype(np.float32),
-            np.concatenate([it[5] for it in items], axis=0).astype(np.float32),
+            np.concatenate([it[4] for it in items], axis=0).astype(np.float32), # var_cat
+            np.concatenate([it[5] for it in items], axis=0).astype(np.float32), # rew_cat
+            np.concatenate([it[6] for it in items], axis=0).astype(np.float32), # done_cat
             lengths
         )
 
@@ -255,9 +257,12 @@ class SyncBridgePlayer(SimpleHeuristicsPlayer):
             
             events = self._battle_events.pop(battle.battle_tag, [])
             obs_flat = self.assembler.assemble(battle, events=events)
-            
-            if getattr(self.cfg.learner, "mode", "ppo") == "imitation":
-                order = super().choose_move(battle)
+            mode = getattr(self.cfg.learner, "mode", "ppo")
+            if mode in ("imitation", "imitation_frozen_backbone", "jepa_pretraining", "imitation_with_jepa"):
+                if mode == "jepa_pretraining" and random.random() < 0.10:
+                    order = self.choose_random_move(battle)
+                else:
+                    order = super().choose_move(battle)
                 action_idx = self.assembler.map_order_to_index(order, battle)
                 
                 # Send directly to the trajectory compiler
@@ -489,11 +494,12 @@ class RolloutWorker:
                     step_tags.append(tag)
                     step_obs.append(payload) 
                 elif event_type == "IMITATION":
-                    traj = self._traj.setdefault(tag, {"obs": [], "act": [], "logp": [], "val": []})
+                    traj = self._traj.setdefault(tag, {"obs": [], "act": [], "logp": [], "val": [], "var": []})
                     traj["obs"].append(payload)    # payload is obs_flat
                     traj["act"].append(extra_data)      # extra is action_idx
                     traj["logp"].append(0.0)
                     traj["val"].append(0.0)
+                    traj["var"].append(0.0)
                 elif event_type == "DONE":
                     self._finalize_trajectory(tag, extra_data)
                 elif event_type == "CLEANUP":
@@ -506,7 +512,7 @@ class RolloutWorker:
                 # This blocks the worker thread until Ray returns the answers.
                 # Because obs_batch is contiguous np.float32, Ray zero-copies it!
                 try:
-                    acts, logps, vals = ray.get(
+                    acts, logps, vals, var = ray.get(
                         self.inference_actor.infer_batch.remote(step_tags, obs_batch)
                     )
                 except Exception as e:
@@ -516,15 +522,17 @@ class RolloutWorker:
                     acts = np.zeros(N, dtype=np.int64)
                     logps = np.zeros(N, dtype=np.float32)
                     vals = np.zeros(N, dtype=np.float32)
+                    var = np.zeros(N, dtype=np.float32)
                 
                 for i, tag in enumerate(step_tags):
                     actions_dict[tag] = int(acts[i])
                     
-                    traj = self._traj.setdefault(tag, {"obs": [], "act": [], "logp": [], "val": []})
+                    traj = self._traj.setdefault(tag, {"obs": [], "act": [], "logp": [], "val": [], "var": []})
                     traj["obs"].append(step_obs[i])
                     traj["act"].append(acts[i])
                     traj["logp"].append(logps[i])
                     traj["val"].append(vals[i])
+                    traj["var"].append(var[i])
 
     def _cleanup_trajectory(self, tag: str):
         """Called when a Zombie/Stall is forcibly killed by the async maintenance thread."""
@@ -565,7 +573,7 @@ class RolloutWorker:
                 
                 self.learner_client.submit_episode(
                     obs_stacked, np.array(buf["act"]), np.array(buf["logp"]),
-                    np.array(buf["val"]), rewards, dones
+                    np.array(buf["val"]), np.array(buf["var"]), rewards, dones
                 )
                 
         self.vec_env.release_slot()

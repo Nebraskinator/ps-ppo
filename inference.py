@@ -205,6 +205,9 @@ class InferenceActor:
             kv_cache_len=kv_cache_len,
         )
         
+        v_probs = torch.softmax(v_logits, dim=-1)
+        v_var = (v_probs * (self.net.v_support - v_exp.unsqueeze(-1))**2).sum(dim=-1)
+        
         # Extract Action Mask
         m_start, m_end = self.assembler.offsets["action_mask"]
         mask_sub = obs[:, m_start:m_end].float()
@@ -221,7 +224,8 @@ class InferenceActor:
         return (
             act_game.cpu().numpy(),
             logp_game.cpu().numpy(),
-            v_exp.cpu().numpy()
+            v_exp.cpu().numpy(),
+            v_var.cpu().numpy()
         )
     
     def set_temp(self, temp: float):

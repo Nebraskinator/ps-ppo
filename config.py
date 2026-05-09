@@ -32,26 +32,26 @@ class ModelConfig:
     
     # Dedicated Embedding Sizes
     emb_dims: Dict[str, int] = field(default_factory=lambda: {
-        "pokemon": 128,
-        "item": 64,
-        "ability": 128,
-        "move": 128,
+        "pokemon": 64,
+        "item": 32,
+        "ability": 64,
+        "move": 64,
         "action": 14,
     })
     
     # Dedicated Subnet Output Sizes
     out_dims: Dict[str, int] = field(default_factory=lambda: {
-        "ability_vec": 96,
-        "pokemon_vec": 768,
-        "global_vec": 128,
-        "transition_vec": 512,
+        "ability_vec": 64,
+        "pokemon_vec": 512,
+        "global_vec": 96,
+        "transition_vec": 416,
     })
     
     # Universal Embedding Bank Sizes
     bank_dims: Dict[str, int] = field(default_factory=lambda: {
-        "val_100": 64,  # HP, Level, Acc, PP
-        "stat": 256,     # Base Stats, Weight, Height
-        "power": 128,    # Move Power
+        "val_100": 32,  # HP, Level, Acc, PP
+        "stat": 64,     # Base Stats, Weight, Height
+        "power": 32,    # Move Power
     })
     
     # Vocabulary Safety Caps
@@ -63,7 +63,7 @@ class ModelConfig:
     
     dropout: float = 0.0
     n_layers: int = 3
-    n_heads: int = 16
+    n_heads: int = 8
     ff_expansion: float = 4.0
     kv_cache_len: int = 64
 
@@ -92,10 +92,10 @@ class RolloutConfig:
     infer_max_pending: int = 20000
 
     learn_min_episodes: int = 1
-    learn_max_episodes: int = 16
+    learn_max_episodes: int = 32
     learn_wait_ms: float = 1.0
     learn_max_pending_episodes: int = 220
-    learn_max_pending_batches: int = 3 
+    learn_max_pending_batches: int = 5 
 
     def worker_kwargs(self) -> Dict[str, Any]:
         """Returns a dictionary suitable for RolloutWorker initialization."""
@@ -120,17 +120,30 @@ class InferenceConfig:
 class LearnerConfig:
     """Core PPO and Hyperparameter settings."""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    mode: str = "imitation"
+    # Supported Modes:
+    #   imitation
+    #   jepa_pretraining
+    #   warmup
+    #   warmup_with_actor_reset
+    #   ppo
+    #   ppo_frozen_backbone
+    mode: str = "ppo_with_jepa"
     
     # Reinforcement Learning Math
     gamma: float = 0.999
-    gae_lambda: float = 0.97
+    gae_lambda: float = 0.75
+    use_dynamic_lambda: bool = True
+    dynamic_lambda_min: float = 0.55
+    dynamic_lambda_max: float = 0.95
+    dynamic_lambda_eps: float = 1e-8
+    
+    jepa_ema_tau: float = 0.99
     
     # Distributional Value (Two-Hot Encoding)
     use_twohot_value: bool = True
     v_min: float = -1.5
     v_max: float = 1.5
-    v_bins: int = 31
+    v_bins: int = 51
     
     # Schedules
     temp_start: float = 1.0
@@ -138,10 +151,10 @@ class LearnerConfig:
     temp_total_steps: int = 500_000
     
     # Optimizer settings
-    lr: float = 1e-4
-    lr_warmup_steps: int = 5_000
-    lr_hold_steps: int = 100_000
-    lr_total_steps: int = 30_000
+    lr: float = 3e-4
+    lr_warmup_steps: int = 1_000
+    lr_hold_steps: int = 500_000
+    lr_total_steps: int = 1_00_000
     weight_decay: float = 1e-2
     
     # Layer-specific LR multipliers (initialized in __post_init__)
@@ -150,17 +163,18 @@ class LearnerConfig:
     lr_v_mult: float = field(init=False)
     
     # PPO Specifics
-    update_epochs: int = 3
-    minibatch_size: int = 1024
-    grad_accum_steps: int = 1
+    update_epochs: int = 2
+    minibatch_size: int = 768
+    grad_accum_steps: int = 4
     batch_seq_len: int = 256
     clip_coef: float = 0.1
     ent_coef: float = 0.02
     vf_coef: float = 0.5
+    jepa_coef: float = 1.0
     clip_vloss: bool = False
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.02
-    steps_per_update: int = 10240
+    steps_per_update: int = 36864
 
     # Checkpointing
     ckpt_dir: str = "checkpoints"
@@ -179,9 +193,9 @@ class LearnerConfig:
             "imitation": (1.0, 1.0, 0.6), # backbone, actor, critic
             "warmup": (0.0, 0.0, 1.0), # backbone, actor, critic
             "ppo": (0.5, 1.0, 2.0), # backbone, actor, critic
+            "warmup_with_actor_reset": (0.0, 1.0, 0.001)
         }
         backbone, pi, v = multipliers.get(self.mode, (1.0, 1.0, 1.0))
-        
         object.__setattr__(self, "lr_backbone_mult", backbone)
         object.__setattr__(self, "lr_pi_mult", pi)
         object.__setattr__(self, "lr_v_mult", v)
