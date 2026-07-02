@@ -890,6 +890,97 @@ def masked_smoothed_cross_entropy(logits: torch.Tensor, targets: torch.Tensor, m
     loss = -(target_dist * log_probs).sum(dim=-1).mean()
     return loss
 
+class MasterWeightOptimizer:
+    """
+    Optimizer wrapper implementing fp32 master weights for a bf16 model.
+
+    The model keeps bf16 parameters for fast forward/backward passes. The
+    inner optimizer (AdamW) steps on persistent fp32 master copies, so small
+    updates are not rounded away by bf16 (~8 mantissa bits) and Adam moments
+    stay in fp32. After each step the masters are copied back into the bf16
+    model params. Gradients are also accumulated in fp32 (call
+    accumulate_grads() after each backward) so grad accumulation across
+    minibatches doesn't lose precision either.
+
+    pairs: list of (model_param, fp32_master) — trainable params only.
+    The inner optimizer's param groups must reference the fp32 masters.
+    """
+
+    def __init__(self, inner: optim.Optimizer, pairs: List[Tuple[torch.Tensor, torch.Tensor]]):
+        self.inner = inner
+        self.pairs = pairs
+
+    @property
+    def param_groups(self):
+        return self.inner.param_groups
+
+    def zero_grad(self, set_to_none: bool = True):
+        self.inner.zero_grad(set_to_none=set_to_none)
+        for model_p, _ in self.pairs:
+            model_p.grad = None
+
+    def accumulate_grads(self):
+        """Flush bf16 model grads into fp32 master grads, then clear them."""
+        for model_p, master_p in self.pairs:
+            if model_p.grad is None:
+                continue
+            g = model_p.grad.detach().to(torch.float32)
+            if master_p.grad is None:
+                master_p.grad = g
+            else:
+                master_p.grad.add_(g)
+            model_p.grad = None
+
+    def clip_and_step(self, max_grad_norm: Optional[float] = None):
+        """Clip fp32 master grads, step, and round masters back into bf16."""
+        masters = [m for _, m in self.pairs if m.grad is not None]
+        if max_grad_norm is not None and masters:
+            nn.utils.clip_grad_norm_(masters, max_grad_norm)
+        self.inner.step()
+        with torch.no_grad():
+            for model_p, master_p in self.pairs:
+                model_p.data.copy_(master_p.data)
+
+    def step(self):
+        self.accumulate_grads()
+        self.clip_and_step(None)
+
+    def sync_masters_from_model(self):
+        """Re-seed masters from model weights (after loading a checkpoint or
+        externally mutating model params, e.g. an actor-head reset)."""
+        with torch.no_grad():
+            for model_p, master_p in self.pairs:
+                master_p.data.copy_(model_p.data.to(torch.float32))
+
+    def state_dict(self):
+        return {
+            "inner": self.inner.state_dict(),
+            "masters": [m.detach().cpu() for _, m in self.pairs],
+        }
+
+    def load_state_dict(self, sd):
+        if "inner" in sd:
+            # New-style checkpoint: restore exact fp32 masters.
+            self.inner.load_state_dict(sd["inner"])
+            with torch.no_grad():
+                for (model_p, master_p), saved in zip(self.pairs, sd["masters"]):
+                    master_p.data.copy_(saved.to(master_p.device))
+                    model_p.data.copy_(master_p.data)
+        else:
+            # Legacy checkpoint (optimizer stepped bf16 weights directly).
+            # torch casts the fp state tensors to the fp32 master dtype on load;
+            # masters themselves were already seeded from the model weights.
+            self.inner.load_state_dict(sd)
+
+
+def _clip_and_step(net: nn.Module, opt, max_grad_norm: float):
+    if isinstance(opt, MasterWeightOptimizer):
+        opt.clip_and_step(max_grad_norm)
+    else:
+        nn.utils.clip_grad_norm_(net.parameters(), max_grad_norm)
+        opt.step()
+
+
 def ppo_update(
     net: nn.Module,
     opt: optim.Optimizer,
@@ -997,9 +1088,12 @@ def ppo_update(
             scaled_loss = loss / grad_accum_steps
             scaled_loss.backward()
 
+            # Accumulate grads in fp32 masters (bf16 accumulation is lossy)
+            if isinstance(opt, MasterWeightOptimizer):
+                opt.accumulate_grads()
+
             if (i + 1) % grad_accum_steps == 0:
-                nn.utils.clip_grad_norm_(net.parameters(), cfg["max_grad_norm"])
-                opt.step()
+                _clip_and_step(net, opt, cfg["max_grad_norm"])
                 opt.zero_grad(set_to_none=True)
                 if scheduler is not None:
                     scheduler.step()
@@ -1016,8 +1110,7 @@ def ppo_update(
                 break
         
         if not stop_training and (i + 1) % grad_accum_steps != 0:
-            nn.utils.clip_grad_norm_(net.parameters(), cfg["max_grad_norm"])
-            opt.step()
+            _clip_and_step(net, opt, cfg["max_grad_norm"])
             opt.zero_grad(set_to_none=True)
             if scheduler is not None:
                 scheduler.step()

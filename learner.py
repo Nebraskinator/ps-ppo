@@ -98,20 +98,26 @@ class LearnerActor:
         base_lr = float(self.cfg.lr)
         
         param_groups = []
-        
+        master_pairs = []  # (bf16 model param, fp32 master) pairs
+
         for zone_name, params in zones.items():
             if not active_grads[zone_name]:
                 continue # Skip frozen zones entirely
-                
+
             decay, no_decay = [], []
             for name, p in params:
+                # fp32 master copy: AdamW steps this; it is rounded back into
+                # the bf16 model param after each step (MasterWeightOptimizer).
+                master = p.detach().to(torch.float32).clone()
+                master_pairs.append((p, master))
+
                 # Standard Transformer Rule: No decay on LayerNorm, Bias, or 1D tensors
                 no_decay_condition = (any(x in name for x in ["_emb", "norm"]) or name.endswith(".bias") or p.ndim == 1)
-                
+
                 if no_decay_condition:
-                    no_decay.append(p)
+                    no_decay.append(master)
                 else:
-                    decay.append(p)
+                    decay.append(master)
                     
             # Pull the mode-specific multiplier from the grid
             target_lr = base_lr * lr_mults[zone_name]
@@ -121,7 +127,8 @@ class LearnerActor:
             if no_decay:
                 param_groups.append({"params": no_decay, "lr": target_lr, "weight_decay": 0.0, "name": f"{zone_name}_stable"})
 
-        self.opt = optim.AdamW(param_groups, eps=1e-5)
+        inner = optim.AdamW(param_groups, eps=1e-5)
+        self.opt = ppo_core.MasterWeightOptimizer(inner, master_pairs)
         self._init_scheduler()
         
     def _get_zone_config(self) -> Tuple[Dict[str, bool], Dict[str, float]]:
@@ -175,7 +182,10 @@ class LearnerActor:
             progress = min(1.0, (step - anneal_start) / max(1, t_steps - anneal_start))
             return 1.0 / ((8 * progress + 1) ** 1.5)
 
-        self.sched = optim.lr_scheduler.LambdaLR(self.opt, lr_lambda=lr_lambda)
+        # LambdaLR requires a torch Optimizer instance; the wrapper's
+        # param_groups are the same objects, so LR updates flow through.
+        sched_opt = self.opt.inner if isinstance(self.opt, ppo_core.MasterWeightOptimizer) else self.opt
+        self.sched = optim.lr_scheduler.LambdaLR(sched_opt, lr_lambda=lr_lambda)
         
     def _enable_compiled_flex_attention(self):
         """
@@ -426,9 +436,12 @@ class LearnerActor:
         """Lazy initialization of the network and optimizer."""
         if self.net is None:
             self._enable_compiled_flex_attention()
+            # Model runs in bf16 for fast forward/backward, but the optimizer
+            # steps fp32 master weights (see MasterWeightOptimizer in ppo_core)
+            # so small updates aren't rounded away by bf16.
             self.net = self.run_cfg.make_model().to(self.cfg.device).train()
             self.net.enable_bf16_recurrent_path()
-            
+
             self.target_net = self.run_cfg.make_model().to(self.cfg.device).eval()
             self.target_net.enable_bf16_recurrent_path()
             self.target_net.load_state_dict(self.net.state_dict())
@@ -489,7 +502,11 @@ class LearnerActor:
         
         # FIX: We intentionally scrubbed attn_mask, so strict must be False
         self.net.load_state_dict(model_weights, strict=False)
-        
+
+        # Re-seed fp32 masters from the loaded (bf16) weights. If the checkpoint
+        # carries exact fp32 masters, opt.load_state_dict below overwrites these.
+        self.opt.sync_masters_from_model()
+
         if hasattr(self, "target_net"):
             if "target_model" in ckpt and ckpt["target_model"] is not None:
                 # Same scrubbing logic for the target net
@@ -510,7 +527,9 @@ class LearnerActor:
                     nn.init.normal_(self.net.pi_head.weight, std=0.02)
                     if hasattr(self.net.pi_head, "bias") and self.net.pi_head.bias is not None:
                         nn.init.zeros_(self.net.pi_head.bias)
-                        
+                # Masters must mirror the freshly reset head weights
+                self.opt.sync_masters_from_model()
+
             print(f"[learner] 🧹 SKIPPING Optimizer/Scheduler load to enforce fresh LR.")
             
             # We treat this as a fresh start, just with pre-trained weights.
